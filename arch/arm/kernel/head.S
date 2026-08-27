@@ -104,10 +104,18 @@ ENTRY(stext)
 	@ ensure svc mode and all interrupts masked
 	safe_svcmode_maskall r9
 
+#ifndef ZIMAGE
+	bl	lumia_head_diag14		@ temporary post-SVC checkpoint
+#else
 	mrc	p15, 0, r9, c0, c0		@ get processor id
+#endif
 	bl	__lookup_processor_type		@ r5=procinfo r9=cpuid
+#ifndef ZIMAGE
+	bl	lumia_head_diag15		@ temporary processor-lookup checkpoint
+#else
 	movs	r10, r5				@ invalid processor (r5=0)?
- THUMB( it	eq )		@ force fixup-able long branch encoding
+#endif
+	 THUMB( it	eq )		@ force fixup-able long branch encoding
 	beq	__error_p			@ yes, error 'p'
 
 #ifdef CONFIG_ARM_LPAE
@@ -169,7 +177,8 @@ ENTRY(stext)
 	ldr	r12, [r10, #PROCINFO_INITFUNC]
 	add	r12, r12, r10
 	ret	r12
-1:	b	__enable_mmu
+1:
+	b	__enable_mmu
 ENDPROC(stext)
 	.ltorg
 
@@ -516,6 +525,36 @@ ENTRY(__turn_mmu_on)
 	ret	r3
 __turn_mmu_on_end:
 ENDPROC(__turn_mmu_on)
+
+#ifndef ZIMAGE
+/*
+ * Called at its kernel virtual address after the setup_arch() DT-machine
+ * lookup. Move to the identity-mapped physical alias before turning
+ * translation and caches off, call the resident LK pulse helper, then stop.
+ */
+
+ENTRY(lumia_setup_arch_fdt_diag23)
+	cpsid	aif			@ make post-IRQ checkpoints safe
+	mov	r4, r0
+	adr	r3, 1f
+	sub	r3, r3, #PAGE_OFFSET
+	bx	r3
+1:
+	mrc	p15, 0, r0, c1, c0, 0
+	bic	r0, r0, #CR_M
+	bic	r0, r0, #CR_C
+	bic	r0, r0, #CR_I
+	mcr	p15, 0, r0, c1, c0, 0
+	dsb
+	isb
+	ldr	sp, =0x073ff100
+	mov	r0, r4
+	movw	r12, #0x0248
+	movt	r12, #0x0730
+	blx	r12
+2:	b	2b
+ENDPROC(lumia_setup_arch_fdt_diag23)
+#endif
 	.popsection
 
 

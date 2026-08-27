@@ -99,7 +99,12 @@ ENTRY(__hyp_stub_install_secondary)
 	 */
 
 	cmp	r4, #HYP_MODE
+
+#ifndef ZIMAGE
+	bne	.Llumia_hyp_stub_done	@ diagnostic return for the boot CPU
+#else
 	retne	lr			@ give up if the CPU is not in HYP mode
+#endif
 
 /*
  * Configure HSCTLR to set correct exception endianness/instruction set
@@ -184,8 +189,108 @@ ARM_BE8(orr	r7, r7, #(1 << 25))     @ HSCTLR.EE
 2:
 #endif
 
+#ifndef ZIMAGE
+.Llumia_hyp_stub_done:
+	/*
+	 * Temporary Lumia 730 no-UART checkpoint. LK remains resident at its
+	 * identity-mapped physical address, and its pulse helper is already
+	 * proven callable with the MMU and D-cache off. Preserve the Linux boot
+	 * registers and emit 13 pulses immediately before returning to head.S.
+	 * Keep this out of the zImage build so its decompressor layout is exact.
+	 */
+	push	{r0-r3, r12, lr}
+	mov	r0, #13
+	movw	r12, #0x0248
+	movt	r12, #0x0730
+	blx	r12
+	pop	{r0-r3, r12, lr}
+#endif
+
 	bx	lr			@ The boot CPU mode is left in r4.
 ENDPROC(__hyp_stub_install_secondary)
+
+#ifndef ZIMAGE
+/*
+ * Temporary Lumia 730 no-UART checkpoint after safe_svcmode_maskall().
+ * The SVC stack is not assumed valid yet, so save the boot registers and
+ * return address in LK's free identity-mapped scratch area and use a fixed
+ * temporary stack while calling the resident LK pulse helper.
+ */
+ENTRY(lumia_head_diag14)
+	ldr	r12, =0x073ff000
+	str	r0, [r12, #0]
+	str	r1, [r12, #4]
+	str	r2, [r12, #8]
+	str	r3, [r12, #12]
+	str	sp, [r12, #16]
+	str	lr, [r12, #20]
+	str	r9, [r12, #24]
+	add	sp, r12, #0x100
+	mov	r0, #14
+	movw	r12, #0x0248
+	movt	r12, #0x0730
+	blx	r12
+	ldr	r12, =0x073ff000
+	ldr	r0, [r12, #0]
+	ldr	r1, [r12, #4]
+	ldr	r2, [r12, #8]
+	ldr	r3, [r12, #12]
+	ldr	sp, [r12, #16]
+	ldr	lr, [r12, #20]
+	mrc	p15, 0, r9, c0, c0		@ preserve the replaced CPU-ID operation
+	bx	lr
+ENDPROC(lumia_head_diag14)
+
+ENTRY(lumia_head_diag15)
+	ldr	r12, =0x073ff000
+	str	r0, [r12, #0]
+	str	r1, [r12, #4]
+	str	r2, [r12, #8]
+	str	r3, [r12, #12]
+	str	sp, [r12, #16]
+	str	lr, [r12, #20]
+	str	r9, [r12, #24]
+	add	sp, r12, #0x100
+	mov	r0, #15
+	movw	r12, #0x0248
+	movt	r12, #0x0730
+	blx	r12
+	ldr	r12, =0x073ff000
+	ldr	r0, [r12, #0]
+	ldr	r1, [r12, #4]
+	ldr	r2, [r12, #8]
+	ldr	r3, [r12, #12]
+	ldr	sp, [r12, #16]
+	ldr	lr, [r12, #20]
+	ldr	r9, [r12, #24]
+	movs	r10, r5				@ preserve the replaced processor check
+	bx	lr
+ENDPROC(lumia_head_diag15)
+
+/* Emit three final pulses after processor setup, immediately before MMU-on. */
+ENTRY(lumia_head_diag19)
+	ldr	r12, =0x073ff000
+	str	r0, [r12, #0]
+	str	r1, [r12, #4]
+	str	r2, [r12, #8]
+	str	r3, [r12, #12]
+	str	sp, [r12, #16]
+	str	lr, [r12, #20]
+	add	sp, r12, #0x100
+	mov	r0, #3
+	movw	r12, #0x0248
+	movt	r12, #0x0730
+	blx	r12
+	ldr	r12, =0x073ff000
+	ldr	r0, [r12, #0]
+	ldr	r1, [r12, #4]
+	ldr	r2, [r12, #8]
+	ldr	r3, [r12, #12]
+	ldr	sp, [r12, #16]
+	ldr	lr, [r12, #20]
+	bx	lr
+ENDPROC(lumia_head_diag19)
+#endif
 
 __hyp_stub_do_trap:
 #ifdef ZIMAGE
@@ -238,4 +343,3 @@ __hyp_stub_trap:	W(b)	__hyp_stub_do_trap
 __hyp_stub_irq:		W(b)	.
 __hyp_stub_fiq:		W(b)	.
 ENDPROC(__hyp_stub_vectors)
-
