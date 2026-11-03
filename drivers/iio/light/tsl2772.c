@@ -72,6 +72,7 @@
 #define TSL2772_ALS_CHAN1HI		0x17
 #define TSL2772_PRX_LO			0x18
 #define TSL2772_PRX_HI			0x19
+#define APDS9930_PRX_OFFSET		0x1e
 
 /* tsl2772 cmd reg masks */
 #define TSL2772_CMD_REG			0x80
@@ -178,6 +179,8 @@ struct tsl2772_chip {
 	int als_saturation;
 	int tsl2772_chip_status;
 	u8 tsl2772_config[TSL2772_MAX_CONFIG_REG];
+	bool has_prox_offset;
+	u8 prox_offset;
 	const struct tsl2772_chip_info	*chip_info;
 	const struct iio_info *info;
 	s64 event_timestamp;
@@ -606,6 +609,46 @@ static int tsl2772_read_prox_diodes(struct tsl2772_chip *chip)
 	return 0;
 }
 
+static int tsl2772_read_prox_profile(struct tsl2772_chip *chip)
+{
+	struct device *dev = &chip->client->dev;
+	u32 value;
+	int ret;
+
+	if (device_property_present(dev, "amstaos,proximity-pulse-count")) {
+		ret = device_property_read_u32(dev, "amstaos,proximity-pulse-count", &value);
+		if (ret)
+			return ret;
+		if (!value || value > 255)
+			return -EINVAL;
+		chip->settings.prox_pulse_count = value;
+	}
+	if (device_property_present(dev, "amstaos,proximity-gain")) {
+		ret = device_property_read_u32(dev, "amstaos,proximity-gain", &value);
+		if (ret)
+			return ret;
+		switch (value) {
+		case 1: chip->settings.prox_gain = 0; break;
+		case 2: chip->settings.prox_gain = 1; break;
+		case 4: chip->settings.prox_gain = 2; break;
+		case 8: chip->settings.prox_gain = 3; break;
+		default: return -EINVAL;
+		}
+	}
+	if (device_property_present(dev, "avago,proximity-offset")) {
+		if (chip->id != apds9930)
+			return -EINVAL;
+		ret = device_property_read_u32(dev, "avago,proximity-offset", &value);
+		if (ret)
+			return ret;
+		if (value > 255)
+			return -EINVAL;
+		chip->prox_offset = value;
+		chip->has_prox_offset = true;
+	}
+	return 0;
+}
+
 static void tsl2772_parse_dt(struct tsl2772_chip *chip)
 {
 	tsl2772_read_prox_led_current(chip);
@@ -701,6 +744,25 @@ static void tsl2772_disable_regulators_action(void *_data)
 	regulator_bulk_disable(ARRAY_SIZE(chip->supplies), chip->supplies);
 }
 
+static int tsl2772_apply_prox_offset(struct tsl2772_chip *chip)
+{
+	int ret;
+	if (chip->has_prox_offset) {
+		ret = i2c_smbus_write_byte_data(chip->client,
+				TSL2772_CMD_REG | APDS9930_PRX_OFFSET, chip->prox_offset);
+		if (ret < 0)
+			return ret;
+		ret = i2c_smbus_read_byte_data(chip->client,
+				TSL2772_CMD_REG | APDS9930_PRX_OFFSET);
+		if (ret < 0)
+			return ret;
+		if (ret != chip->prox_offset)
+			return -EIO;
+	}
+
+	return 0;
+}
+
 static int tsl2772_chip_on(struct iio_dev *indio_dev)
 {
 	struct tsl2772_chip *chip = iio_priv(indio_dev);
@@ -783,6 +845,10 @@ static int tsl2772_chip_on(struct iio_dev *indio_dev)
 			return ret;
 		}
 	}
+
+	ret = tsl2772_apply_prox_offset(chip);
+	if (ret < 0)
+		return ret;
 
 	/* Power-on settling time */
 	usleep_range(3000, 3500);
@@ -1234,12 +1300,15 @@ static int tsl2772_read_raw(struct iio_dev *indio_dev,
 			    long mask)
 {
 	struct tsl2772_chip *chip = iio_priv(indio_dev);
+	int ret;
 
 	switch (mask) {
 	case IIO_CHAN_INFO_PROCESSED:
 		switch (chan->type) {
 		case IIO_LIGHT:
-			tsl2772_get_lux(indio_dev);
+			ret = tsl2772_get_lux(indio_dev);
+			if (ret < 0)
+				return ret;
 			*val = chip->als_cur_info.lux;
 			return IIO_VAL_INT;
 		default:
@@ -1248,14 +1317,18 @@ static int tsl2772_read_raw(struct iio_dev *indio_dev,
 	case IIO_CHAN_INFO_RAW:
 		switch (chan->type) {
 		case IIO_INTENSITY:
-			tsl2772_get_lux(indio_dev);
+			ret = tsl2772_get_lux(indio_dev);
+			if (ret < 0)
+				return ret;
 			if (chan->channel == 0)
 				*val = chip->als_cur_info.als_ch0;
 			else
 				*val = chip->als_cur_info.als_ch1;
 			return IIO_VAL_INT;
 		case IIO_PROXIMITY:
-			tsl2772_get_prox(indio_dev);
+			ret = tsl2772_get_prox(indio_dev);
+			if (ret < 0)
+				return ret;
 			*val = chip->prox_data;
 			return IIO_VAL_INT;
 		default:
@@ -1348,6 +1421,29 @@ static int tsl2772_write_raw(struct iio_dev *indio_dev,
 
 	return tsl2772_invoke_change(indio_dev);
 }
+
+/* Actual emitter/gain/offset signature for userspace calibration matching. */
+static ssize_t in_proximity0_config_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+	struct tsl2772_chip *chip = iio_priv(indio_dev);
+	int pulse, control, offset, ret;
+
+	if (chip->id != apds9930)
+		return -EOPNOTSUPP;
+	mutex_lock(&chip->prox_mutex);
+	pulse = i2c_smbus_read_byte_data(chip->client, TSL2772_CMD_REG | TSL2772_PRX_COUNT);
+	control = i2c_smbus_read_byte_data(chip->client, TSL2772_CMD_REG | TSL2772_GAIN);
+	offset = i2c_smbus_read_byte_data(chip->client, TSL2772_CMD_REG | APDS9930_PRX_OFFSET);
+	ret = pulse < 0 ? pulse : control < 0 ? control : offset < 0 ? offset : 0;
+	mutex_unlock(&chip->prox_mutex);
+	if (ret)
+		return ret;
+	return sysfs_emit(buf, "%u %u %u\n", pulse, control & 0xfc, offset);
+}
+
+static DEVICE_ATTR_RO(in_proximity0_config);
 
 static DEVICE_ATTR_RW(in_illuminance0_target_input);
 
@@ -1446,6 +1542,7 @@ static struct attribute *tsl2772_PRX2_device_attrs[] = {
 };
 
 static struct attribute *tsl2772_ALSPRX2_device_attrs[] = {
+	&dev_attr_in_proximity0_config.attr,
 	&dev_attr_in_illuminance0_target_input.attr,
 	&dev_attr_in_illuminance0_calibrate.attr,
 	&dev_attr_in_illuminance0_lux_table.attr,
@@ -1847,6 +1944,9 @@ static int tsl2772_probe(struct i2c_client *clientp)
 	}
 
 	tsl2772_defaults(chip);
+	ret = tsl2772_read_prox_profile(chip);
+	if (ret)
+		return ret;
 	ret = tsl2772_chip_on(indio_dev);
 	if (ret < 0)
 		return ret;

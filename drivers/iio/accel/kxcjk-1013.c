@@ -1639,6 +1639,7 @@ static const struct i2c_device_id kxcjk1013_id[] = {
 	{ "kxcj91008",  (kernel_ulong_t)&kxcj91008_info },
 	{ "kxtj21009",  (kernel_ulong_t)&kxtj21009_info },
 	{ "kxtf9", (kernel_ulong_t)&kxtf9_info },
+	{ "kx022-1020", (kernel_ulong_t)&kx0231025_info },
 	{ "kx023-1025", (kernel_ulong_t)&kx0231025_info },
 	{ }
 };
@@ -1649,6 +1650,7 @@ static const struct of_device_id kxcjk1013_of_match[] = {
 	{ .compatible = "kionix,kxcj91008", &kxcj91008_info },
 	{ .compatible = "kionix,kxtj21009", &kxtj21009_info },
 	{ .compatible = "kionix,kxtf9", &kxtf9_info },
+	{ .compatible = "kionix,kx022-1020", &kx0231025_info },
 	{ .compatible = "kionix,kx023-1025", &kx0231025_info },
 	{ }
 };
