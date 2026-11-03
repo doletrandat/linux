@@ -675,6 +675,14 @@ static void adsp_unassign_memory_region(struct qcom_adsp *adsp)
 	}
 }
 
+/* Keep the Superman bring-up endpoint offline until an explicit sysfs start. */
+static bool superman_manual_adsp_boot(struct device *dev)
+{
+    return of_machine_is_compatible("nokia,superman") &&
+        of_device_is_compatible(dev->of_node, "qcom,msm8226-adsp-pil") &&
+        of_property_read_bool(dev->of_node, "nokia,manual-adsp-boot");
+}
+
 static int adsp_probe(struct platform_device *pdev)
 {
 	const struct adsp_data *desc;
@@ -715,7 +723,7 @@ static int adsp_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 
-	rproc->auto_boot = desc->auto_boot;
+	rproc->auto_boot = desc->auto_boot && !superman_manual_adsp_boot(&pdev->dev);
 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
 
 	adsp = rproc->priv;
