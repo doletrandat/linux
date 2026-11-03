@@ -11,6 +11,11 @@
 #include <linux/regulator/consumer.h>
 #include "rmi_driver.h"
 
+/* Keep the existing Android init power-up delay effective after module rebuilds. */
+static unsigned int startup_delay_ms;
+module_param(startup_delay_ms, uint, 0444);
+MODULE_PARM_DESC(startup_delay_ms, "Minimum probe power-up delay (0..1000 ms)");
+
 #define BUFFER_SIZE_INCREMENT 32
 
 /**
@@ -206,6 +211,9 @@ static int rmi_i2c_probe(struct i2c_client *client)
 	struct rmi_i2c_xport *rmi_i2c;
 	int error;
 
+	if (startup_delay_ms > 1000)
+		return -EINVAL;
+
 	rmi_i2c = devm_kzalloc(&client->dev, sizeof(struct rmi_i2c_xport),
 				GFP_KERNEL);
 	if (!rmi_i2c)
@@ -248,6 +256,9 @@ static int rmi_i2c_probe(struct i2c_client *client)
 
 	of_property_read_u32(client->dev.of_node, "syna,startup-delay-ms",
 			     &rmi_i2c->startup_delay);
+	rmi_i2c->startup_delay = max(rmi_i2c->startup_delay, startup_delay_ms);
+	dev_info(&client->dev, "touch probe: addr=0x%02x irq=%d supplies-enabled delay-ms=%u\n",
+		 client->addr, client->irq, rmi_i2c->startup_delay);
 
 	msleep(rmi_i2c->startup_delay);
 
