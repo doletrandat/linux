@@ -52,6 +52,7 @@ int wcn36xx_pmc_exit_bmps_state(struct wcn36xx *wcn,
 				struct ieee80211_vif *vif)
 {
 	struct wcn36xx_vif *vif_priv = wcn36xx_vif_to_priv(vif);
+	int ret;
 
 	if (WCN36XX_BMPS != vif_priv->pw_state) {
 		/* Unbalanced call or last BMPS enter failed */
@@ -59,7 +60,9 @@ int wcn36xx_pmc_exit_bmps_state(struct wcn36xx *wcn,
 			    "Not in BMPS mode, no need to exit\n");
 		return -EALREADY;
 	}
-	wcn36xx_smd_exit_bmps(wcn, vif);
+	ret = wcn36xx_smd_exit_bmps(wcn, vif);
+	if (ret)
+		return ret;
 	vif_priv->pw_state = WCN36XX_FULL_POWER;
 	vif->driver_flags &= ~IEEE80211_VIF_BEACON_FILTER;
 	return 0;

@@ -632,6 +632,16 @@ static int wcn36xx_hw_scan(struct ieee80211_hw *hw,
 {
 	struct wcn36xx *wcn = hw->priv;
 
+	/* Associated hardware and software scans can stall this firmware. */
+	if (of_machine_is_compatible("nokia,superman") &&
+	    of_machine_is_compatible("qcom,msm8226") &&
+	    wcn->rf_id == RF_IRIS_WCN3620 && vif->cfg.assoc) {
+		wcn36xx_dbg(WCN36XX_DBG_MAC,
+			    "connected scan deferred on Superman WCN3620\n");
+		/* shortcut: reconnect to scan other APs until firmware scans are safe. */
+		return -EBUSY;
+	}
+
 	if (!wcn36xx_firmware_get_feat_caps(wcn->fw_feat_caps, SCAN_OFFLOAD)) {
 		/* fallback to mac80211 software scan */
 		return 1;
