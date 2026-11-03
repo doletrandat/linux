@@ -1521,6 +1521,8 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	<reg32 offset="0x307a" name="VBIF_PERF_PWR_CNT1_HI"/>
 	<reg32 offset="0x307b" name="VBIF_PERF_PWR_CNT2_LO"/>
 	<reg32 offset="0x307c" name="VBIF_PERF_PWR_CNT2_HI"/>
+	<reg32 offset="0x3080" name="VBIF_XIN_HALT_CTRL0"/>
+	<reg32 offset="0x3081" name="VBIF_XIN_HALT_CTRL1"/>
 
 
 	<reg32 offset="0x0c01" name="VSC_BIN_SIZE">

@@ -679,14 +679,20 @@ void adreno_recover(struct msm_gpu *gpu)
 	// XXX pm-runtime??  we *need* the device to be off after this
 	// so maybe continuing to call ->pm_suspend/resume() is better?
 
-	gpu->funcs->pm_suspend(gpu);
-	gpu->funcs->pm_resume(gpu);
+	/* The recovery worker must not replay if any transition fails. */
+	gpu->needs_hw_init = true;
+	ret = gpu->funcs->pm_suspend(gpu);
+	if (ret)
+		goto failed;
+	ret = gpu->funcs->pm_resume(gpu);
+	if (ret)
+		goto failed;
 
 	ret = msm_gpu_hw_init(gpu);
-	if (ret) {
-		DRM_DEV_ERROR(dev->dev, "gpu hw init failed: %d\n", ret);
-		/* hmm, oh well? */
-	}
+	if (!ret)
+		return;
+failed:
+	DRM_DEV_ERROR(dev->dev, "gpu recovery failed: %d\n", ret);
 }
 
 void adreno_flush(struct msm_gpu *gpu, struct msm_ringbuffer *ring, u32 reg)

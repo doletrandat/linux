@@ -264,7 +264,7 @@ static const struct component_ops a3xx_ops = {
 	.unbind = adreno_unbind,
 };
 
-static void adreno_device_register_headless(void)
+static struct platform_device *adreno_device_register_headless(void)
 {
 	/* on imx5, we don't have a top-level mdp/dpu node
 	 * this creates a dummy node for the driver for that case
@@ -279,7 +279,12 @@ static void adreno_device_register_headless(void)
 		.size_data = 0,
 		.dma_mask = ~0,
 	};
-	platform_device_register_full(&dummy_info);
+	return platform_device_register_full(&dummy_info);
+}
+
+static void adreno_unregister_headless(void *data)
+{
+	platform_device_unregister(data);
 }
 
 static int adreno_probe(struct platform_device *pdev)
@@ -291,8 +296,22 @@ static int adreno_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	if (of_device_is_compatible(pdev->dev.of_node, "amd,imageon"))
+	if (msm_render_only) {
+		struct platform_device *headless;
+
+		headless = adreno_device_register_headless();
+		if (IS_ERR(headless))
+			ret = PTR_ERR(headless);
+		else
+			ret = devm_add_action_or_reset(&pdev->dev,
+					adreno_unregister_headless, headless);
+		if (ret) {
+			component_del(&pdev->dev, &a3xx_ops);
+			return ret;
+		}
+	} else if (of_device_is_compatible(pdev->dev.of_node, "amd,imageon")) {
 		adreno_device_register_headless();
+	}
 
 	return 0;
 }
@@ -425,9 +444,9 @@ static struct platform_driver adreno_driver = {
 	},
 };
 
-void __init adreno_register(void)
+int __init adreno_register(void)
 {
-	platform_driver_register(&adreno_driver);
+	return platform_driver_register(&adreno_driver);
 }
 
 void __exit adreno_unregister(void)

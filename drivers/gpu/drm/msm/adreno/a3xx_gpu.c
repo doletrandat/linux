@@ -7,6 +7,9 @@
  */
 
 #include "a3xx_gpu.h"
+#include "../msm_mmu.h"
+#include <linux/iopoll.h>
+#include <linux/of.h>
 
 #define A3XX_INT0_MASK \
 	(A3XX_INT0_RBBM_AHB_ERROR |        \
@@ -116,6 +119,7 @@ static int a3xx_hw_init(struct msm_gpu *gpu)
 	uint32_t *ptr, len;
 	int i, ret;
 
+	msm_gpu_diag(gpu, "a3xx_register_init", 0, 0);
 	DBG("%s", gpu->name);
 
 	if (adreno_is_a305(adreno_gpu)) {
@@ -274,7 +278,9 @@ static int a3xx_hw_init(struct msm_gpu *gpu)
 
 	gpu_write(gpu, REG_A3XX_RBBM_INT_0_MASK, A3XX_INT0_MASK);
 
+	msm_gpu_diag(gpu, "adreno_common_init_begin", 0, 0);
 	ret = adreno_hw_init(gpu);
+	msm_gpu_diag(gpu, "adreno_common_init_end", ret, 0);
 	if (ret)
 		return ret;
 
@@ -421,6 +427,14 @@ static irqreturn_t a3xx_irq(struct msm_gpu *gpu)
 	uint32_t status;
 
 	status = gpu_read(gpu, REG_A3XX_RBBM_INT_0_STATUS);
+	msm_gpu_diag(gpu, "irq_status", 0, status);
+	if (status & A3XX_INT0_RBBM_AHB_ERROR) {
+		msm_gpu_diag(gpu, "ahb_error_status", 0,
+			gpu_read(gpu, REG_A3XX_RBBM_AHB_ERROR_STATUS));
+		/* KGSL acknowledges the AHB latch separately from INT_CLEAR. */
+		gpu_write(gpu, REG_A3XX_RBBM_AHB_CMD, BIT(3));
+		msm_gpu_diag(gpu, "ahb_error_ack", 0, BIT(3));
+	}
 	DBG("%s: %08x", gpu->name, status);
 
 	// TODO
@@ -508,12 +522,64 @@ static u32 a3xx_get_rptr(struct msm_gpu *gpu, struct msm_ringbuffer *ring)
 	return ring->memptrs->rptr;
 }
 
+/* Match downstream A3xx: A305/A305b have six XIN ports; A306/A306a three. */
+static int a3xx_vbif_halt(struct msm_gpu *gpu)
+{
+	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+	u32 mask = (adreno_is_a306(adreno_gpu) || adreno_is_a306a(adreno_gpu)) ?
+		GENMASK(2, 0) : GENMASK(5, 0);
+	u32 ack, request;
+	int ret;
+
+	msm_gpu_diag(gpu, "vbif_request", 0, mask);
+	gpu_write(gpu, REG_A3XX_VBIF_XIN_HALT_CTRL0, mask);
+	request = gpu_read(gpu, REG_A3XX_VBIF_XIN_HALT_CTRL0);
+	msm_gpu_diag(gpu, "vbif_request_readback", 0, request);
+	/* P22 on Lumia 730 reads back only three implemented XIN bits.
+	 * Restrict this capability quirk to this board and the exact
+	 * observed A305B request pattern.  Keep other masks and failures.
+	 */
+	if (adreno_is_a305b(adreno_gpu) &&
+	    of_machine_is_compatible("nokia,superman") &&
+	    mask == GENMASK(5, 0) && request == GENMASK(2, 0)) {
+		mask = GENMASK(2, 0);
+		msm_gpu_diag(gpu, "vbif_superman_three_xin", 0, mask);
+	}
+	ret = readl_poll_timeout(gpu->mmio + (REG_A3XX_VBIF_XIN_HALT_CTRL1 << 2),
+				 ack, (ack & mask) == mask, 1, 10000);
+	msm_gpu_diag(gpu, "vbif_ack", ret ? -EBUSY : 0, ack);
+	if (ret) {
+		msm_gpu_diag(gpu, "vbif_failure_rbbm_status", -EBUSY,
+			gpu_read(gpu, REG_A3XX_RBBM_STATUS));
+		msm_gpu_diag(gpu, "vbif_failure_ahb_status", -EBUSY,
+			gpu_read(gpu, REG_A3XX_RBBM_AHB_ERROR_STATUS));
+	}
+	/* A failed suspend must leave the powered device usable for retry. */
+	gpu_write(gpu, REG_A3XX_VBIF_XIN_HALT_CTRL0, 0);
+	return ret ? -EBUSY : 0;
+}
+
+static int a3xx_pm_suspend(struct msm_gpu *gpu)
+{
+	int ret;
+
+	/* P17 retains failed translations and power until reboot. */
+	if (msm_mmu_is_faulted(gpu->aspace ? gpu->aspace->mmu : NULL))
+		return -EIO;
+	if (!a3xx_idle(gpu))
+		return -EBUSY;
+	ret = a3xx_vbif_halt(gpu);
+	if (ret)
+		return ret;
+	return msm_gpu_pm_suspend(gpu);
+}
+
 static const struct adreno_gpu_funcs funcs = {
 	.base = {
 		.get_param = adreno_get_param,
 		.set_param = adreno_set_param,
 		.hw_init = a3xx_hw_init,
-		.pm_suspend = msm_gpu_pm_suspend,
+		.pm_suspend = a3xx_pm_suspend,
 		.pm_resume = msm_gpu_pm_resume,
 		.recover = a3xx_recover,
 		.submit = a3xx_submit,

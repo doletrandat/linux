@@ -2490,6 +2490,8 @@ struct msm_gpu *a6xx_gpu_init(struct drm_device *dev)
 
 	adreno_gpu = &a6xx_gpu->base;
 	gpu = &adreno_gpu->base;
+	/* a6xx/a7xx command streams write per-submit cycle/timestamp stats. */
+	gpu->has_hw_submit_stats = true;
 
 	mutex_init(&a6xx_gpu->gmu.lock);
 
