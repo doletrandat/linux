@@ -1001,7 +1001,8 @@ static int rpmpd_aggregate_corner(struct rpmpd *pd)
 
 	/* Clamp to the highest corner/level if sync_state isn't done yet */
 	if (!pd->state_synced)
-		this_active_corner = this_sleep_corner = pd->max_state - 1;
+		this_active_corner = this_sleep_corner =
+			max(pd->corner, pd->max_state - 1);
 	else
 		to_active_sleep(pd, pd->corner, &this_active_corner, &this_sleep_corner);
 
@@ -1115,8 +1116,12 @@ static int rpmpd_probe(struct platform_device *pdev)
 		}
 
 		rpmpds[i]->max_state = desc->max_state;
-		rpmpds[i]->pd.power_off = rpmpd_power_off;
-		rpmpds[i]->pd.power_on = rpmpd_power_on;
+		/* Floor votes must not toggle the shared physical regulator. */
+		if (rpmpds[i]->key != cpu_to_le32(KEY_FLOOR_CORNER) &&
+		    rpmpds[i]->key != cpu_to_le32(KEY_FLOOR_LEVEL)) {
+			rpmpds[i]->pd.power_off = rpmpd_power_off;
+			rpmpds[i]->pd.power_on = rpmpd_power_on;
+		}
 		rpmpds[i]->pd.set_performance_state = rpmpd_set_performance;
 		rpmpds[i]->pd.flags = GENPD_FLAG_ACTIVE_WAKEUP;
 		pm_genpd_init(&rpmpds[i]->pd, NULL, true);

@@ -1,0 +1,8 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause */
+#ifndef __DT_BINDINGS_INTERCONNECT_QCOM_MSM8226_MMCC_H
+#define __DT_BINDINGS_INTERCONNECT_QCOM_MSM8226_MMCC_H
+
+#define MASTER_MMSS_AXI 0
+#define SLAVE_MMSS_AXI 1
+
+#endif

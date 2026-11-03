@@ -15,6 +15,7 @@
 
 #include <dt-bindings/clock/qcom,mmcc-msm8974.h>
 #include <dt-bindings/reset/qcom,mmcc-msm8974.h>
+#include <dt-bindings/interconnect/qcom,msm8226-mmcc.h>
 
 #include "common.h"
 #include "clk-regmap.h"
@@ -2520,6 +2521,10 @@ static const struct regmap_config mmcc_msm8226_regmap_config = {
 	.fast_io	= true,
 };
 
+static const struct qcom_icc_hws_data msm8226_icc_hws[] = {
+	{ MASTER_MMSS_AXI, SLAVE_MMSS_AXI, MMSS_AXI_CLK_SRC },
+};
+
 static const struct qcom_cc_desc mmcc_msm8226_desc = {
 	.config = &mmcc_msm8226_regmap_config,
 	.clks = mmcc_msm8226_clocks,
@@ -2528,6 +2533,9 @@ static const struct qcom_cc_desc mmcc_msm8226_desc = {
 	.num_resets = ARRAY_SIZE(mmcc_msm8226_resets),
 	.gdscs = mmcc_msm8226_gdscs,
 	.num_gdscs = ARRAY_SIZE(mmcc_msm8226_gdscs),
+	.icc_hws = msm8226_icc_hws,
+	.num_icc_hws = ARRAY_SIZE(msm8226_icc_hws),
+	.icc_first_node_id = 8226,
 };
 
 static struct clk_regmap *mmcc_msm8974_clocks[] = {
