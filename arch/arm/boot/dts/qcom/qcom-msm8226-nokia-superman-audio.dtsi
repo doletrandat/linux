@@ -1,0 +1,11 @@
+// Exact Lumia 730 AUDD L25 supply, controlled by RPM; inactive until requested.
+&{/remoteproc/smd-edge/rpm-requests/regulators} {
+ superman_audio_l25: l25 {};
+};
+/ {
+ superman-audio-board-power {
+  compatible = "nokia,superman-audio-board-power";
+  vddio-supply = <&superman_audio_l25>;
+  status = "okay";
+ };
+};

@@ -10,6 +10,7 @@
 
 #include "qcom-msm8226.dtsi"
 #include "qcom-msm8226-microsoft-common.dtsi"
+#include <dt-bindings/clock/qcom,rpmcc.h>
 #include <dt-bindings/leds/common.h>
 
 /*
@@ -93,9 +94,54 @@
 		reg = <0x28>;
 
 		interrupt-parent = <&tlmm>;
-		interrupts = <21 IRQ_TYPE_LEVEL_HIGH>;
+		interrupts = <21 IRQ_TYPE_EDGE_RISING>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&nfc_irq_pin>;
 
 		enable-gpios = <&tlmm 20 GPIO_ACTIVE_HIGH>;
 		firmware-gpios = <&tlmm 22 GPIO_ACTIVE_HIGH>;
+		vdd-supply = <&pm8226_s4>;
+		vddio-supply = <&pm8226_l6>;
+		clocks = <&rpmcc RPM_SMD_CXO_D1>;
+		clock-names = "bbclk2";
 	};
+};
+
+&tlmm {
+	nfc_irq_pin: nfc-irq-state {
+		pins = "gpio21";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+};
+
+/* Measurement only: retain inherited charger current/voltage/thermal limits. */
+&pm8226_vadc {
+	channel@6 {
+		reg = <VADC_VBAT_SNS>;
+		qcom,pre-scaling = <1 3>;
+		label = "vbat_sns";
+	};
+
+	channel@30 {
+		reg = <VADC_LR_MUX1_BAT_THERM>;
+		qcom,ratiometric;
+		label = "batt_therm";
+	};
+};
+
+&smbb {
+	io-channels = <&pm8226_vadc VADC_VBAT_SNS>,
+		      <&pm8226_vadc VADC_LR_MUX1_BAT_THERM>;
+	io-channel-names = "vbat", "batt-therm";
+	nokia,superman-batt-thermistor;
+	nokia,usb-current-policy;
+};
+
+/* KX022 is rear-mounted; keep Android axes right-handed in portrait. */
+&accelerometer {
+	mount-matrix = "-1", "0", "0",
+		       "0", "1", "0",
+		       "0", "0", "-1";
 };

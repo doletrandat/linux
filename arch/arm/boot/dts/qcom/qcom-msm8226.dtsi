@@ -1317,6 +1317,8 @@
 				 <&mmcc OXILICX_AXI_CLK>;
 			clock-names = "core", "iface", "mem_iface";
 
+			iommus = <&gpu_iommu 0>;
+
 			sram = <&gmu_sram>;
 			power-domains = <&mmcc OXILICX_GDSC>;
 			operating-points-v2 = <&gpu_opp_table>;
@@ -1341,6 +1343,37 @@
 				opp-19000000 {
 					opp-hz = /bits/ 64 <19000000>;
 				};
+			};
+		};
+
+		/* Diagnostic foundation: keep disabled until power/firmware gates pass. */
+		gpu_iommu: iommu@fdb10000 {
+			compatible = "qcom,msm8226-gpu-iommu";
+			reg = <0xfdb10000 0x2600>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+			#iommu-cells = <1>;
+			ranges = <0 0xfdb18000 0x2000>;
+
+			clocks = <&mmcc OXILICX_AHB_CLK>,
+				 <&mmcc OXILICX_AXI_CLK>,
+				 <&mmcc OXILI_GFX3D_CLK>;
+			clock-names = "iface", "bus", "tbu";
+			power-domains = <&mmcc OXILICX_GDSC>;
+			status = "disabled";
+
+			/* User SID0 / context bank0 */
+			iommu-ctx@0 {
+				compatible = "qcom,msm-iommu-v1-ns";
+				reg = <0x0 0x1000>;
+				interrupts = <GIC_SPI 241 IRQ_TYPE_LEVEL_HIGH>;
+			};
+
+			/* Private SID1 / context bank1 */
+			iommu-ctx@1000 {
+				compatible = "qcom,msm-iommu-v1-ns";
+				reg = <0x1000 0x1000>;
+				interrupts = <GIC_SPI 241 IRQ_TYPE_LEVEL_HIGH>;
 			};
 		};
 

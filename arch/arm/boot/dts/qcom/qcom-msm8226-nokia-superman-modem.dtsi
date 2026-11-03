@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* PF29 selected-DT equivalent. External driver keeps auto_boot=false.
+ * The DT itself starts no processor. The separately qualified SD startup
+ * service owns RMTFS/MSS; no Android Radio HAL is provided here. */
+&mpss_region { status = "okay"; };
+&mba_region { status = "okay"; };
+/ {
+ reserved-memory {
+  /* Stock Lumia RFS0 data window. Keep all other quarantine bytes reserved. */
+  diagnostic-quarantine@f500000 { reg = <0x0f500000 0x00880000>; };
+  diagnostic-quarantine@ff00000 { reg = <0x0ff00000 0x00100000>; no-map; };
+  rmtfs@fd80000 {
+   compatible = "qcom,rmtfs-mem";
+   reg = <0x0fd80000 0x00180000>;
+   no-map;
+   qcom,client-id = <1>;
+  };
+ };
+};
+&modem {
+ status = "okay";
+ mx-supply = <&pm8226_l3>;
+ pll-supply = <&pm8226_l8>;
+ firmware-name = "qcom/superman/mba-pf29.b00", "qcom/superman/qcdsp28626.mbn";
+};
