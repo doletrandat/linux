@@ -1666,3 +1666,11 @@ endmenu
 source "net/netfilter/ipset/Kconfig"
 
 source "net/netfilter/ipvs/Kconfig"
+
+config NETFILTER_XT_MATCH_QUOTA2
+	bool "Android named packet/byte quota accounting"
+	depends on NETFILTER_XTABLES && PROC_FS
+
+config NETFILTER_XT_MATCH_QUOTA2_LOG
+	bool "Android quota notifications"
+	depends on NETFILTER_XT_MATCH_QUOTA2
