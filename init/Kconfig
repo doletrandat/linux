@@ -975,6 +975,18 @@ menuconfig CGROUPS
 
 if CGROUPS
 
+config CGROUP_V1_ANDROID_ATTACH
+	bool "Allow privileged Android cgroup v1 task attachment"
+	depends on ANDROID_BINDER_IPC
+	help
+	  Allow a file opener with CAP_SYS_NICE in the initial user namespace
+	  to move tasks owned by another UID through cgroup v1 tasks/procs.
+	  Android system_server uses this to apply app scheduling profiles.
+	  File permissions and credentials saved at open remain enforced.
+	  This does not change cgroup v2 delegation or unprivileged attachment.
+
+	  Say N unless using Android userspace with cgroup v1 task profiles.
+
 config PAGE_COUNTER
 	bool
 

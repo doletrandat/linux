@@ -519,7 +519,9 @@ static ssize_t __cgroup1_procs_write(struct kernfs_open_file *of,
 	tcred = get_task_cred(task);
 	if (!uid_eq(cred->euid, GLOBAL_ROOT_UID) &&
 	    !uid_eq(cred->euid, tcred->uid) &&
-	    !uid_eq(cred->euid, tcred->suid))
+	    !uid_eq(cred->euid, tcred->suid) &&
+	    !(IS_ENABLED(CONFIG_CGROUP_V1_ANDROID_ATTACH) &&
+	      file_ns_capable(of->file, &init_user_ns, CAP_SYS_NICE)))
 		ret = -EACCES;
 	put_cred(tcred);
 	if (ret)

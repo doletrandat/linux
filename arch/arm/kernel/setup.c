@@ -1315,7 +1315,11 @@ static int c_show(struct seq_file *m, void *v)
 		seq_printf(m, "CPU revision\t: %d\n\n", cpuid & 15);
 	}
 
-	seq_printf(m, "Hardware\t: %s\n", machine_name);
+	if (of_machine_is_compatible("nokia,superman") &&
+	    of_machine_is_compatible("qcom,msm8226"))
+		seq_puts(m, "Hardware\t: Nokia Lumia 730 (Qualcomm MSM8226)\n");
+	else
+		seq_printf(m, "Hardware\t: %s\n", machine_name);
 	seq_printf(m, "Revision\t: %04x\n", system_rev);
 	seq_printf(m, "Serial\t\t: %s\n", system_serial);
 
