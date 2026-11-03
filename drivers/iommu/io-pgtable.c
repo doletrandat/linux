@@ -95,7 +95,11 @@ void free_io_pgtable_ops(struct io_pgtable_ops *ops)
 		return;
 
 	iop = io_pgtable_ops_to_pgtable(ops);
+	if (io_pgtable_tlb_sync_failed(iop))
+		return;
 	io_pgtable_tlb_flush_all(iop);
+	if (io_pgtable_tlb_sync_failed(iop))
+		return;
 	io_pgtable_init_table[iop->fmt]->free(iop);
 }
 EXPORT_SYMBOL_GPL(free_io_pgtable_ops);

@@ -595,6 +595,9 @@ static void __arm_lpae_free_pgtable(struct arm_lpae_io_pgtable *data, int lvl,
 	arm_lpae_iopte *start, *end;
 	unsigned long table_size;
 
+	if (io_pgtable_tlb_sync_failed(&data->iop))
+		return;
+
 	if (lvl == data->start_level)
 		table_size = ARM_LPAE_PGD_SIZE(data);
 	else

@@ -35,10 +35,14 @@ enum io_pgtable_fmt {
  *                  others may decide to update the iommu_iotlb_gather structure
  *                  and defer the invalidation until iommu_iotlb_sync() instead.
  *
+ * @tlb_sync_failed: Optional sticky failure status. Once true, page tables
+ *                  must be retained until the client is physically quiesced.
+ *
  * Note that these can all be called in atomic context and must therefore
  * not block.
  */
 struct iommu_flush_ops {
+	bool (*tlb_sync_failed)(void *cookie);
 	void (*tlb_flush_all)(void *cookie);
 	void (*tlb_flush_walk)(unsigned long iova, size_t size, size_t granule,
 			       void *cookie);
@@ -269,6 +273,13 @@ struct io_pgtable {
 };
 
 #define io_pgtable_ops_to_pgtable(x) container_of((x), struct io_pgtable, ops)
+
+static inline bool
+io_pgtable_tlb_sync_failed(struct io_pgtable *iop)
+{
+	return iop->cfg.tlb && iop->cfg.tlb->tlb_sync_failed &&
+		iop->cfg.tlb->tlb_sync_failed(iop->cookie);
+}
 
 static inline void io_pgtable_tlb_flush_all(struct io_pgtable *iop)
 {

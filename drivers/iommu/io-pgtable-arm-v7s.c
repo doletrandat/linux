@@ -302,6 +302,10 @@ static void __arm_v7s_free_table(void *table, int lvl,
 	struct device *dev = cfg->iommu_dev;
 	size_t size = ARM_V7S_TABLE_SIZE(lvl, cfg);
 
+	/* A failed walk-cache invalidation can still reference this table. */
+	if (io_pgtable_tlb_sync_failed(&data->iop))
+		return;
+
 	if (!cfg->coherent_walk)
 		dma_unmap_single(dev, __arm_v7s_dma_addr(table), size,
 				 DMA_TO_DEVICE);
