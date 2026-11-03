@@ -131,6 +131,7 @@ static void secondary_biglittle_init(void)
 int __cpu_up(unsigned int cpu, struct task_struct *idle)
 {
 	int ret;
+	unsigned long wait_remaining;
 
 	if (!smp_ops.smp_boot_secondary)
 		return -ENOSYS;
@@ -164,15 +165,18 @@ int __cpu_up(unsigned int cpu, struct task_struct *idle)
 		 * CPU was successfully started, wait for it
 		 * to come online or time out.
 		 */
-		wait_for_completion_timeout(&cpu_running,
+		wait_remaining = wait_for_completion_timeout(&cpu_running,
 						 msecs_to_jiffies(1000));
 
 		if (!cpu_online(cpu)) {
-			pr_crit("CPU%u: failed to come online\n", cpu);
+			pr_crit("SUPERMAN_SMP_MIN CPU%u: failed to come online (wait_remaining=%lu)\n",
+				cpu, wait_remaining);
 			ret = -EIO;
 		}
+		if (smp_ops.smp_boot_report)
+			smp_ops.smp_boot_report(cpu);
 	} else {
-		pr_err("CPU%u: failed to boot: %d\n", cpu, ret);
+		pr_err("SUPERMAN_SMP_MIN CPU%u: failed to boot: %d\n", cpu, ret);
 	}
 
 

@@ -338,9 +338,32 @@ static int msm8660_boot_secondary(unsigned int cpu, struct task_struct *idle)
 	return qcom_boot_secondary(cpu, scss_release_secondary);
 }
 
+/* Local diagnostic state, written only after the wake-up IPI call returns. */
+struct cortex_a7_boot_record {
+	bool release_attempted;
+	int release_ret;
+};
+static DEFINE_PER_CPU(struct cortex_a7_boot_record, cortex_a7_boot_records);
+
 static int cortex_a7_boot_secondary(unsigned int cpu, struct task_struct *idle)
 {
-	return qcom_boot_secondary(cpu, cortex_a7_release_secondary);
+	bool attempted = !per_cpu(cold_boot_done, cpu);
+	int ret;
+
+	ret = qcom_boot_secondary(cpu, cortex_a7_release_secondary);
+	per_cpu(cortex_a7_boot_records, cpu).release_attempted = attempted;
+	per_cpu(cortex_a7_boot_records, cpu).release_ret = ret;
+	return ret;
+}
+
+static void cortex_a7_boot_report(unsigned int cpu)
+{
+	const struct cortex_a7_boot_record *record;
+
+	record = &per_cpu(cortex_a7_boot_records, cpu);
+	pr_info("SUPERMAN_SMP_RELEASE CPU%u: method=cortex-a7 release_attempted=%u release_ret=%d cold_boot_done=%d wake_ipi_returned=1\n",
+		cpu, (unsigned int)record->release_attempted,
+		record->release_ret, per_cpu(cold_boot_done, cpu));
 }
 
 static int kpssv1_boot_secondary(unsigned int cpu, struct task_struct *idle)
@@ -379,6 +402,7 @@ CPU_METHOD_OF_DECLARE(qcom_smp, "qcom,gcc-msm8660", &smp_msm8660_ops);
 static const struct smp_operations qcom_smp_cortex_a7_ops __initconst = {
 	.smp_prepare_cpus	= qcom_smp_prepare_cpus,
 	.smp_boot_secondary	= cortex_a7_boot_secondary,
+	.smp_boot_report	= cortex_a7_boot_report,
 #ifdef CONFIG_HOTPLUG_CPU
 	.cpu_die		= qcom_cpu_die,
 #endif

@@ -92,6 +92,8 @@ struct smp_operations {
 	 * This also gives us the initial stack to use for this CPU.
 	 */
 	int  (*smp_boot_secondary)(unsigned int cpu, struct task_struct *idle);
+	/* Local diagnostic: report on the booting CPU after its completion wait. */
+	void (*smp_boot_report)(unsigned int cpu);
 #ifdef CONFIG_HOTPLUG_CPU
 	int  (*cpu_kill)(unsigned int cpu);
 	void (*cpu_die)(unsigned int cpu);

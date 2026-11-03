@@ -192,18 +192,10 @@ ARM_BE8(orr	r7, r7, #(1 << 25))     @ HSCTLR.EE
 #ifndef ZIMAGE
 .Llumia_hyp_stub_done:
 	/*
-	 * Temporary Lumia 730 no-UART checkpoint. LK remains resident at its
-	 * identity-mapped physical address, and its pulse helper is already
-	 * proven callable with the MMU and D-cache off. Preserve the Linux boot
-	 * registers and emit 13 pulses immediately before returning to head.S.
-	 * Keep this out of the zImage build so its decompressor layout is exact.
+	 * This return path is shared with secondary_startup, before the
+	 * secondary stack is initialized. Do not use the stack or call
+	 * resident bootloader code here; return directly to head.S.
 	 */
-	push	{r0-r3, r12, lr}
-	mov	r0, #13
-	movw	r12, #0x0248
-	movt	r12, #0x0730
-	blx	r12
-	pop	{r0-r3, r12, lr}
 #endif
 
 	bx	lr			@ The boot CPU mode is left in r4.
