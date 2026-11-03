@@ -128,6 +128,9 @@ static int wcnss_ctrl_smd_callback(struct rpmsg_device *rpdev,
 	const struct wcnss_version_resp *version;
 	const struct wcnss_msg_hdr *hdr = data;
 
+	if (count < (int)sizeof(*hdr) || hdr->len != count)
+		return -EINVAL;
+
 	switch (hdr->type) {
 	case WCNSS_VERSION_RESP:
 		if (count != sizeof(*version)) {
@@ -177,6 +180,7 @@ static int wcnss_request_version(struct wcnss_ctrl *wcnss)
 
 	msg.type = WCNSS_VERSION_REQ;
 	msg.len = sizeof(msg);
+	reinit_completion(&wcnss->ack);
 	ret = rpmsg_send(wcnss->channel, &msg, sizeof(msg));
 	if (ret < 0)
 		return ret;
@@ -223,6 +227,12 @@ static int wcnss_download_nv(struct wcnss_ctrl *wcnss, bool *expect_cbc)
 
 	data = fw->data;
 	left = fw->size;
+	if (left <= 4) {
+		ret = -EINVAL;
+		goto release_fw;
+	}
+	reinit_completion(&wcnss->ack);
+	wcnss->ack_status = 0;
 
 	req->hdr.type = WCNSS_DOWNLOAD_NV_REQ;
 	req->hdr.len = sizeof(*req) + NV_FRAGMENT_SIZE;
@@ -257,9 +267,13 @@ static int wcnss_download_nv(struct wcnss_ctrl *wcnss, bool *expect_cbc)
 	if (!ret) {
 		dev_err(dev, "timeout waiting for nv upload ack\n");
 		ret = -ETIMEDOUT;
-	} else {
+	} else if (wcnss->ack_status == WCNSS_ACK_DONE_BOOTING ||
+		   wcnss->ack_status == WCNSS_ACK_COLD_BOOTING) {
 		*expect_cbc = wcnss->ack_status == WCNSS_ACK_COLD_BOOTING;
 		ret = 0;
+	} else {
+		dev_err(dev, "nv upload rejected: %d\n", wcnss->ack_status);
+		ret = -EREMOTEIO;
 	}
 
 release_fw:
@@ -305,8 +319,10 @@ static void wcnss_async_probe(struct work_struct *work)
 	/* Wait for pending cold boot completion if indicated by the nv downloader */
 	if (expect_cbc) {
 		ret = wait_for_completion_timeout(&wcnss->cbc, WCNSS_REQUEST_TIMEOUT);
-		if (!ret)
+		if (!ret) {
 			dev_err(wcnss->dev, "expected cold boot completion\n");
+			return;
+		}
 	}
 
 	of_platform_populate(wcnss->dev->of_node, NULL, NULL, wcnss->dev);

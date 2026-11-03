@@ -14,6 +14,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
@@ -178,9 +179,11 @@ static void wcnss_indicate_nv_download(struct qcom_wcnss *wcnss)
 	writel(val, wcnss->spare_out);
 }
 
-static void wcnss_configure_iris(struct qcom_wcnss *wcnss)
+static int wcnss_configure_iris(struct qcom_wcnss *wcnss)
 {
 	u32 val;
+	u32 status;
+	int ret;
 
 	/* Clear PMU cfg register */
 	writel(0, wcnss->pmu_cfg);
@@ -201,8 +204,10 @@ static void wcnss_configure_iris(struct qcom_wcnss *wcnss)
 	writel(val, wcnss->pmu_cfg);
 
 	/* Wait for PMU.iris_reg_reset_sts */
-	while (readl(wcnss->pmu_cfg) & WCNSS_PMU_IRIS_RESET_STS)
-		cpu_relax();
+	ret = readl_poll_timeout(wcnss->pmu_cfg, status,
+				 !(status & WCNSS_PMU_IRIS_RESET_STS), 10, 100000);
+	if (ret)
+		return ret;
 
 	/* Clear IRIS reset */
 	val &= ~WCNSS_PMU_IRIS_RESET;
@@ -213,8 +218,10 @@ static void wcnss_configure_iris(struct qcom_wcnss *wcnss)
 	writel(val, wcnss->pmu_cfg);
 
 	/* Wait for XO configuration to finish */
-	while (readl(wcnss->pmu_cfg) & WCNSS_PMU_IRIS_XO_CFG_STS)
-		cpu_relax();
+	ret = readl_poll_timeout(wcnss->pmu_cfg, status,
+				 !(status & WCNSS_PMU_IRIS_XO_CFG_STS), 10, 100000);
+	if (ret)
+		return ret;
 
 	/* Stop IRIS XO configuration */
 	val &= ~WCNSS_PMU_GC_BUS_MUX_SEL_TOP;
@@ -223,6 +230,7 @@ static void wcnss_configure_iris(struct qcom_wcnss *wcnss)
 
 	/* Add some delay for XO to settle */
 	msleep(20);
+	return 0;
 }
 
 static int wcnss_start(struct rproc *rproc)
@@ -255,7 +263,11 @@ static int wcnss_start(struct rproc *rproc)
 		goto disable_regulators;
 
 	wcnss_indicate_nv_download(wcnss);
-	wcnss_configure_iris(wcnss);
+	ret = wcnss_configure_iris(wcnss);
+	if (ret) {
+		dev_err(wcnss->dev, "IRIS reset/XO configuration timed out\n");
+		goto disable_iris;
+	}
 
 	ret = qcom_scm_pas_auth_and_reset(WCNSS_PAS_ID);
 	if (ret) {
@@ -476,10 +488,18 @@ static int wcnss_init_regulators(struct qcom_wcnss *wcnss,
 		return ret;
 
 	for (i = 0; i < num_vregs; i++) {
-		if (info[i].max_voltage)
-			regulator_set_voltage(bulk[i].consumer,
-					      info[i].min_voltage,
-					      info[i].max_voltage);
+		if (info[i].max_voltage) {
+			int min_uv = info[i].min_voltage;
+			int max_uv = info[i].max_voltage;
+
+			/* Match the phone's stock RIVA L3/MX vote. */
+			if (of_machine_is_compatible("nokia,superman") &&
+			    !strcmp(info[i].name, "vddmx"))
+				min_uv = max_uv = 1150000;
+			ret = regulator_set_voltage(bulk[i].consumer, min_uv, max_uv);
+			if (ret)
+				return ret;
+		}
 
 		if (info[i].load_uA)
 			regulator_set_load(bulk[i].consumer, info[i].load_uA);
@@ -582,6 +602,9 @@ static int wcnss_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 	rproc_coredump_set_elf_info(rproc, ELFCLASS32, EM_NONE);
+	/* First Superman radio candidate must be started explicitly after boot. */
+	if (of_machine_is_compatible("nokia,superman"))
+		rproc->auto_boot = false;
 
 	wcnss = rproc->priv;
 	wcnss->dev = &pdev->dev;

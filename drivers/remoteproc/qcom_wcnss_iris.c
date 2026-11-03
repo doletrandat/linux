@@ -180,10 +180,23 @@ struct qcom_iris *qcom_iris_probe(struct device *parent, bool *use_48mhz_xo)
 	}
 
 	for (i = 0; i < iris->num_vregs; i++) {
-		if (data->vregs[i].max_voltage)
-			regulator_set_voltage(iris->vregs[i].consumer,
-					      data->vregs[i].min_voltage,
-					      data->vregs[i].max_voltage);
+		if (data->vregs[i].max_voltage) {
+			int min_uv = data->vregs[i].min_voltage;
+			int max_uv = data->vregs[i].max_voltage;
+
+			/* Superman's stock RIVA PSTATE fixes L16/PA at 3.0 V. */
+			if (data == &wcn3620_data &&
+			    of_machine_is_compatible("nokia,superman") &&
+			    !strcmp(data->vregs[i].name, "vddpa"))
+				min_uv = max_uv = 3000000;
+			ret = regulator_set_voltage(iris->vregs[i].consumer,
+						    min_uv, max_uv);
+			if (ret) {
+				dev_err(&iris->dev, "invalid %s voltage request: %d\n",
+					data->vregs[i].name, ret);
+				goto err_device_del;
+			}
+		}
 
 		if (data->vregs[i].load_uA)
 			regulator_set_load(iris->vregs[i].consumer,
