@@ -17,6 +17,7 @@
  */
 
 #include <linux/errno.h>
+#include <linux/iio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -28,6 +29,11 @@
 #include <linux/slab.h>
 #include <linux/extcon-provider.h>
 #include <linux/regulator/driver.h>
+
+#include <linux/workqueue.h>
+#include <linux/ktime.h>
+#include <linux/pm.h>
+#include "superman_battery_policy.h"
 
 #define SMBB_CHG_VMAX		0x040
 #define SMBB_CHG_VSAFE		0x041
@@ -121,9 +127,55 @@ struct smbb_charger {
 	struct power_supply *bat_psy;
 	struct regmap *regmap;
 
+	struct iio_channel *vbat;
+	struct iio_channel *batt_therm;
+	struct mutex adc_lock;
+	struct delayed_work temp_work;
+	struct smbb_superman_temp_policy temp_policy;
+	struct smbb_superman_voltage_policy voltage_policy;
+	bool superman_batt_therm;
+	struct mutex usb_input_lock;
+	bool usb_input_control;
+	struct power_supply_desc usb_desc;
+	struct power_supply_desc bat_desc;
+
 	struct regulator_desc otg_rdesc;
 	struct regulator_dev *otg_reg;
 };
+
+struct smbb_temp_point {
+	int mv;
+	int decic;
+};
+
+/* Stock Superman ACPI BTTB: ratiometric VADC millivolts to 0.1 C. */
+static const struct smbb_temp_point superman_batt_temp[] = {
+	{ 1680, -300 }, { 1593, -200 }, { 1469, -100 }, { 1309, 0 },
+	{ 1125, 100 }, { 939, 200 }, { 768, 300 }, { 627, 400 },
+	{ 516, 500 }, { 434, 600 }, { 374, 700 }, { 331, 800 },
+};
+
+static int smbb_superman_batt_temp(int mv)
+{
+	unsigned int i;
+
+	if (mv >= superman_batt_temp[0].mv)
+		return superman_batt_temp[0].decic;
+	if (mv <= superman_batt_temp[ARRAY_SIZE(superman_batt_temp) - 1].mv)
+		return superman_batt_temp[ARRAY_SIZE(superman_batt_temp) - 1].decic;
+
+	for (i = 1; i < ARRAY_SIZE(superman_batt_temp); i++) {
+		const struct smbb_temp_point *cold = &superman_batt_temp[i - 1];
+		const struct smbb_temp_point *warm = &superman_batt_temp[i];
+
+		if (mv >= warm->mv)
+			return cold->decic +
+				(warm->decic - cold->decic) * (cold->mv - mv) /
+				(cold->mv - warm->mv);
+	}
+
+	return -ERANGE;
+}
 
 static const unsigned int smbb_usb_extcon_cable[] = {
 	EXTCON_USB,
@@ -253,6 +305,47 @@ static const struct smbb_charger_attr {
 	},
 };
 
+/* This Linux path has no BIF authentication, so never select the HV table. */
+static bool smbb_superman_no_bif(struct smbb_charger *chg)
+{
+	return of_machine_is_compatible("nokia,superman") &&
+	       of_machine_is_compatible("qcom,msm8226") &&
+	       of_property_read_bool(chg->dev->of_node,
+				     "nokia,superman-batt-thermistor");
+}
+
+static int smbb_superman_prepare_limits(struct smbb_charger *chg)
+{
+	unsigned int value;
+	int rc;
+
+	if (!smbb_superman_no_bif(chg))
+		return 0;
+	/* Keep charging off until probe has verified both conservative limits. */
+	rc = regmap_update_bits(chg->regmap, chg->addr + SMBB_CHG_CTRL,
+				CTRL_EN, 0);
+	if (rc)
+		return rc;
+	rc = regmap_read(chg->regmap, chg->addr + SMBB_CHG_CTRL, &value);
+	if (rc)
+		return rc;
+	return value & CTRL_EN ? -EIO : 0;
+}
+
+/* Stock Superman EFIESP battery.json: unauthenticated BV-T5A limits. */
+static unsigned int smbb_superman_limit(struct smbb_charger *chg,
+		enum smbb_attr which, unsigned int val)
+{
+	if (!smbb_superman_no_bif(chg))
+		return val;
+
+	if (which == ATTR_BAT_VMAX)
+		return min(val, 4100000U);
+	if (which == ATTR_BAT_IMAX)
+		return min(val, 900000U);
+	return val;
+}
+
 static int smbb_charger_attr_write(struct smbb_charger *chg,
 		enum smbb_attr which, unsigned int val)
 {
@@ -268,6 +361,8 @@ static int smbb_charger_attr_write(struct smbb_charger *chg,
 			prop->name, prop->min, prop->max);
 		return -EINVAL;
 	}
+
+	val = smbb_superman_limit(chg, which, val);
 
 	if (prop->safe_reg) {
 		rc = regmap_read(chg->regmap,
@@ -296,6 +391,15 @@ static int smbb_charger_attr_write(struct smbb_charger *chg,
 		dev_err(chg->dev, "unable to update %s", prop->name);
 		return rc;
 	}
+	if (smbb_superman_no_bif(chg) &&
+	    (which == ATTR_BAT_VMAX || which == ATTR_BAT_IMAX)) {
+		rc = regmap_read(chg->regmap, chg->addr + prop->reg, &out);
+		if (rc)
+			return rc;
+		if (out != wval)
+			return -EIO;
+	}
+
 	out = prop->hw_fn(wval);
 	if (out != val) {
 		dev_warn(chg->dev,
@@ -347,7 +451,13 @@ static int smbb_charger_attr_parse(struct smbb_charger *chg,
 		if (!rc || !prop->fail_ok)
 			return rc;
 	}
-	return smbb_charger_attr_read(chg, which);
+	rc = smbb_charger_attr_read(chg, which);
+	if (rc)
+		return rc;
+	val = smbb_superman_limit(chg, which, chg->attr[which]);
+	if (val != chg->attr[which])
+		return smbb_charger_attr_write(chg, which, val);
+	return 0;
 }
 
 static void smbb_set_line_flag(struct smbb_charger *chg, int irq, int flag)
@@ -379,6 +489,7 @@ static irqreturn_t smbb_usb_valid_handler(int irq, void *_data)
 	extcon_set_state_sync(chg->edev, EXTCON_USB,
 				chg->status & STATUS_USBIN_VALID);
 	power_supply_changed(chg->usb_psy);
+	power_supply_changed(chg->bat_psy);
 
 	return IRQ_HANDLED;
 }
@@ -390,6 +501,7 @@ static irqreturn_t smbb_dc_valid_handler(int irq, void *_data)
 	smbb_set_line_flag(chg, irq, STATUS_DCIN_VALID);
 	if (!chg->dc_disabled)
 		power_supply_changed(chg->dc_psy);
+	power_supply_changed(chg->bat_psy);
 
 	return IRQ_HANDLED;
 }
@@ -405,13 +517,11 @@ static irqreturn_t smbb_bat_temp_handler(int irq, void *_data)
 		return IRQ_HANDLED;
 
 	mutex_lock(&chg->statlock);
-	if (val & TEMP_STATUS_OK) {
+	chg->status &= ~(STATUS_BAT_OK | STATUS_BAT_HOT);
+	if (val & TEMP_STATUS_OK)
 		chg->status |= STATUS_BAT_OK;
-	} else {
-		chg->status &= ~STATUS_BAT_OK;
-		if (val & TEMP_STATUS_HOT)
-			chg->status |= STATUS_BAT_HOT;
-	}
+	else if (val & TEMP_STATUS_HOT)
+		chg->status |= STATUS_BAT_HOT;
 	mutex_unlock(&chg->statlock);
 
 	power_supply_changed(chg->bat_psy);
@@ -485,12 +595,55 @@ static const struct smbb_irq {
 	{ "dc-valid", smbb_dc_valid_handler },
 };
 
+/* Only the observed SMBBP family exposes this optional input policy. */
+#define SMBB_USB_INPUT_SUSPEND 0x347
+static bool smbb_usb_input_supported(struct smbb_charger *chg)
+{
+	static const unsigned int offsets[] = { 0x005, 0x105, 0x305, 0x605 };
+	static const unsigned int types[] = { 0x31, 0x32, 0x34, 0x37 };
+	unsigned int value, i;
+
+	if (!of_machine_is_compatible("nokia,superman") ||
+	    !of_machine_is_compatible("qcom,msm8226") ||
+	    !of_property_read_bool(chg->dev->of_node, "nokia,usb-current-policy"))
+		return false;
+	for (i = 0; i < ARRAY_SIZE(offsets); i++)
+		if (regmap_read(chg->regmap, chg->addr + offsets[i], &value) ||
+		    value != types[i])
+			return false;
+	return true;
+}
+
+static int smbb_usb_input_limit(struct smbb_charger *chg, int ua)
+{
+	int rc;
+
+	if (!chg->usb_input_control)
+		return -EOPNOTSUPP;
+	if (ua && (ua < 100000 || ua > 500000))
+		return -EINVAL;
+	mutex_lock(&chg->usb_input_lock);
+	if (!ua) {
+		rc = regmap_update_bits(chg->regmap,
+			chg->addr + SMBB_USB_INPUT_SUSPEND, BIT(0), BIT(0));
+	} else {
+		/* Program a bounded limit before allowing USB input again. */
+		rc = smbb_charger_attr_write(chg, ATTR_USBIN_IMAX, ua);
+		if (!rc)
+			rc = regmap_update_bits(chg->regmap,
+				chg->addr + SMBB_USB_INPUT_SUSPEND, BIT(0), 0);
+	}
+	mutex_unlock(&chg->usb_input_lock);
+	return rc;
+}
+
 static int smbb_usbin_get_property(struct power_supply *psy,
 		enum power_supply_property psp,
 		union power_supply_propval *val)
 {
 	struct smbb_charger *chg = power_supply_get_drvdata(psy);
 	int rc = 0;
+	unsigned int suspend;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_ONLINE:
@@ -498,6 +651,16 @@ static int smbb_usbin_get_property(struct power_supply *psy,
 		val->intval = !(chg->status & STATUS_CHG_GONE) &&
 				(chg->status & STATUS_USBIN_VALID);
 		mutex_unlock(&chg->statlock);
+		break;
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		if (!chg->usb_input_control)
+			return -EOPNOTSUPP;
+		mutex_lock(&chg->usb_input_lock);
+		rc = regmap_read(chg->regmap,
+			chg->addr + SMBB_USB_INPUT_SUSPEND, &suspend);
+		if (!rc)
+			val->intval = suspend & BIT(0) ? 0 : chg->attr[ATTR_USBIN_IMAX];
+		mutex_unlock(&chg->usb_input_lock);
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
 		val->intval = chg->attr[ATTR_USBIN_IMAX];
@@ -521,9 +684,18 @@ static int smbb_usbin_set_property(struct power_supply *psy,
 	int rc;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		rc = smbb_usb_input_limit(chg, val->intval);
+		if (!rc) {
+			power_supply_changed(chg->usb_psy);
+			power_supply_changed(chg->bat_psy);
+		}
+		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+		mutex_lock(&chg->usb_input_lock);
 		rc = smbb_charger_attr_write(chg, ATTR_USBIN_IMAX,
 				val->intval);
+		mutex_unlock(&chg->usb_input_lock);
 		break;
 	default:
 		rc = -EINVAL;
@@ -587,6 +759,102 @@ static int smbb_charger_writable_property(struct power_supply *psy,
 	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT;
 }
 
+/* Stock Superman EFIESP battery.json; specifications, not measured SOC. */
+static int smbb_superman_battery_info(struct smbb_charger *chg,
+		enum power_supply_property psp, union power_supply_propval *val)
+{
+	if (!smbb_superman_no_bif(chg))
+		return -EINVAL;
+	switch (psp) {
+	case POWER_SUPPLY_PROP_MODEL_NAME:
+		val->strval = "BV-T5A";
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+		val->intval = 2220000;
+		return 0;
+	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
+		val->intval = 8400000;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int smbb_superman_read_temp(struct smbb_charger *chg, int *decic)
+{
+	int rc;
+	mutex_lock(&chg->adc_lock);
+	if (!chg->batt_therm) {
+		chg->batt_therm = devm_iio_channel_get(chg->dev, "batt-therm");
+		if (IS_ERR(chg->batt_therm)) {
+			rc = PTR_ERR(chg->batt_therm);
+			chg->batt_therm = NULL;
+			mutex_unlock(&chg->adc_lock);
+			return rc;
+		}
+	}
+	/* A ratiometric qcom-spmi-vadc SCALE_DEFAULT result is millivolts. */
+	rc = iio_read_channel_processed(chg->batt_therm, decic);
+	/* Direct processed channels return a positive IIO_VAL_* on success. */
+	if (rc >= 0)
+		*decic = smbb_superman_batt_temp(*decic);
+	mutex_unlock(&chg->adc_lock);
+	return rc < 0 ? rc : 0;
+}
+
+/* Keep ADC deferral separate from charger/extcon registration. */
+static int smbb_superman_read_voltage(struct smbb_charger *chg, int *uv)
+{
+	int rc;
+
+	mutex_lock(&chg->adc_lock);
+	if (!chg->vbat) {
+		chg->vbat = devm_iio_channel_get(chg->dev, "vbat");
+		if (IS_ERR(chg->vbat)) {
+			rc = PTR_ERR(chg->vbat);
+			chg->vbat = NULL;
+			mutex_unlock(&chg->adc_lock);
+			return rc;
+		}
+	}
+	/* qcom-spmi-vadc SCALE_DEFAULT returns microvolts. */
+	rc = iio_read_channel_processed(chg->vbat, uv);
+	mutex_unlock(&chg->adc_lock);
+	return rc < 0 ? rc : 0;
+}
+
+static void smbb_superman_voltage_reset(struct smbb_charger *chg)
+{
+	bool previous;
+
+	mutex_lock(&chg->statlock);
+	previous = chg->voltage_policy.critical;
+	chg->voltage_policy.initialized = false;
+	chg->voltage_policy.critical = false;
+	mutex_unlock(&chg->statlock);
+	if (previous)
+		power_supply_changed(chg->bat_psy);
+}
+
+static void smbb_superman_voltage_work(struct smbb_charger *chg)
+{
+	unsigned long long now;
+	bool previous, critical;
+	int uv = 0;
+
+	if (smbb_superman_read_voltage(chg, &uv))
+		uv = 0;
+	now = ktime_to_ms(ktime_get_boottime());
+	mutex_lock(&chg->statlock);
+	previous = chg->voltage_policy.critical;
+	if (!(chg->status & STATUS_BAT_PRESENT))
+		uv = 0;
+	critical = smbb_superman_voltage_update(&chg->voltage_policy, uv, now);
+	mutex_unlock(&chg->statlock);
+	if (critical != previous)
+		power_supply_changed(chg->bat_psy);
+}
+
 static int smbb_battery_get_property(struct power_supply *psy,
 		enum power_supply_property psp,
 		union power_supply_propval *val)
@@ -633,6 +901,21 @@ static int smbb_battery_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = !!(status & STATUS_BAT_PRESENT);
 		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		return smbb_superman_read_voltage(chg, &val->intval);
+	case POWER_SUPPLY_PROP_CAPACITY_LEVEL:
+		if (!smbb_superman_no_bif(chg))
+			return -EINVAL;
+		mutex_lock(&chg->statlock);
+		val->intval = (chg->status & STATUS_BAT_PRESENT) &&
+			smbb_superman_voltage_critical(&chg->voltage_policy,
+				ktime_to_ms(ktime_get_boottime())) ?
+			POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL :
+			POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN;
+		mutex_unlock(&chg->statlock);
+		break;
+	case POWER_SUPPLY_PROP_TEMP:
+		return smbb_superman_read_temp(chg, &val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		val->intval = chg->attr[ATTR_BAT_IMAX];
 		break;
@@ -647,8 +930,12 @@ static int smbb_battery_get_property(struct power_supply *psy,
 		val->intval = POWER_SUPPLY_TECHNOLOGY_LION;
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
-		val->intval = 3000000; /* single-cell li-ion low end */
+		val->intval = smbb_superman_no_bif(chg) ? 3300000 : 3000000;
 		break;
+	case POWER_SUPPLY_PROP_MODEL_NAME:
+	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
+		return smbb_superman_battery_info(chg, psp, val);
 	default:
 		rc = -EINVAL;
 		break;
@@ -706,7 +993,16 @@ static enum power_supply_property smbb_battery_properties[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
+	/* Optional per-device properties: copied and compacted during probe. */
+	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_TEMP,
+	POWER_SUPPLY_PROP_MODEL_NAME,
+	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
+	POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN,
+	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 };
+
+#define SMBB_BATTERY_BASE_PROPERTIES (ARRAY_SIZE(smbb_battery_properties) - 6)
 
 static const struct reg_off_mask_default {
 	unsigned int offset;
@@ -759,20 +1055,36 @@ static const struct power_supply_desc bat_psy_desc = {
 	.name = "smbb-bif",
 	.type = POWER_SUPPLY_TYPE_BATTERY,
 	.properties = smbb_battery_properties,
-	.num_properties = ARRAY_SIZE(smbb_battery_properties),
+	.num_properties = SMBB_BATTERY_BASE_PROPERTIES,
 	.get_property = smbb_battery_get_property,
 	.set_property = smbb_battery_set_property,
 	.property_is_writeable = smbb_battery_writable_property,
 };
 
+static enum power_supply_property smbb_usb_properties[] = {
+	POWER_SUPPLY_PROP_ONLINE,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
+};
+
+static int smbb_usb_writable_property(struct power_supply *psy,
+		enum power_supply_property psp)
+{
+	struct smbb_charger *chg = power_supply_get_drvdata(psy);
+
+	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT ||
+		(psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT && chg->usb_input_control);
+}
+
 static const struct power_supply_desc usb_psy_desc = {
 	.name = "smbb-usbin",
 	.type = POWER_SUPPLY_TYPE_USB,
-	.properties = smbb_charger_properties,
-	.num_properties = ARRAY_SIZE(smbb_charger_properties),
+	.properties = smbb_usb_properties,
+	.num_properties = ARRAY_SIZE(smbb_usb_properties) - 1,
 	.get_property = smbb_usbin_get_property,
 	.set_property = smbb_usbin_set_property,
-	.property_is_writeable = smbb_charger_writable_property,
+	.property_is_writeable = smbb_usb_writable_property,
 };
 
 static const struct power_supply_desc dc_psy_desc = {
@@ -828,6 +1140,79 @@ static const struct regulator_ops smbb_chg_otg_ops = {
 	.is_enabled = smbb_chg_otg_is_enabled,
 };
 
+static int smbb_superman_charge_enable(struct smbb_charger *chg, bool enable)
+{
+	unsigned int value;
+	int rc;
+
+	rc = regmap_update_bits(chg->regmap, chg->addr + SMBB_CHG_CTRL,
+				CTRL_EN, enable ? CTRL_EN : 0);
+	if (rc)
+		return rc;
+	rc = regmap_read(chg->regmap, chg->addr + SMBB_CHG_CTRL, &value);
+	if (rc)
+		return rc;
+	return !!(value & CTRL_EN) == enable ? 0 : -EIO;
+}
+
+static void smbb_superman_temp_work(struct work_struct *work)
+{
+	struct smbb_charger *chg = container_of(to_delayed_work(work),
+			struct smbb_charger, temp_work);
+	bool allowed = false;
+	int decic, rc;
+
+	rc = smbb_superman_read_temp(chg, &decic);
+	if (rc >= 0)
+		allowed = smbb_superman_temp_update(&chg->temp_policy, decic,
+				ktime_to_ms(ktime_get_boottime()));
+	else
+		chg->temp_policy.initialized = false;
+
+	rc = smbb_superman_charge_enable(chg, allowed);
+	if (rc) {
+		/* An enable/readback failure must never be treated as permission. */
+		int stop_rc = smbb_superman_charge_enable(chg, false);
+
+		dev_err_ratelimited(chg->dev,
+			"thermal charge gate error=%d stop_error=%d\n", rc, stop_rc);
+	}
+	smbb_superman_voltage_work(chg);
+	queue_delayed_work(system_freezable_wq, &chg->temp_work,
+			msecs_to_jiffies(5000));
+}
+
+static int __maybe_unused smbb_superman_suspend(struct device *dev)
+{
+	struct smbb_charger *chg = dev_get_drvdata(dev);
+	int rc;
+
+	if (!smbb_superman_no_bif(chg))
+		return 0;
+	cancel_delayed_work_sync(&chg->temp_work);
+	smbb_superman_voltage_reset(chg);
+	rc = smbb_superman_charge_enable(chg, false);
+	if (rc) {
+		chg->temp_policy.initialized = false;
+		queue_delayed_work(system_freezable_wq, &chg->temp_work, 0);
+	}
+	return rc;
+}
+
+static int __maybe_unused smbb_superman_resume(struct device *dev)
+{
+	struct smbb_charger *chg = dev_get_drvdata(dev);
+
+	if (smbb_superman_no_bif(chg)) {
+		chg->temp_policy.initialized = false;
+		queue_delayed_work(system_freezable_wq, &chg->temp_work, 0);
+	}
+	return 0;
+}
+
+static SIMPLE_DEV_PM_OPS(smbb_superman_pm_ops,
+		smbb_superman_suspend, smbb_superman_resume);
+
 static int smbb_charger_probe(struct platform_device *pdev)
 {
 	struct power_supply_config bat_cfg = {};
@@ -835,6 +1220,7 @@ static int smbb_charger_probe(struct platform_device *pdev)
 	struct power_supply_config dc_cfg = {};
 	struct smbb_charger *chg;
 	struct regulator_config config = { };
+	enum power_supply_property *bat_props;
 	int rc, i;
 
 	chg = devm_kzalloc(&pdev->dev, sizeof(*chg), GFP_KERNEL);
@@ -843,6 +1229,8 @@ static int smbb_charger_probe(struct platform_device *pdev)
 
 	chg->dev = &pdev->dev;
 	mutex_init(&chg->statlock);
+	mutex_init(&chg->adc_lock);
+	mutex_init(&chg->usb_input_lock);
 
 	chg->regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!chg->regmap) {
@@ -871,6 +1259,10 @@ static int smbb_charger_probe(struct platform_device *pdev)
 
 	chg->dc_disabled = of_property_read_bool(pdev->dev.of_node, "qcom,disable-dc");
 
+	rc = smbb_superman_prepare_limits(chg);
+	if (rc)
+		return rc;
+
 	for (i = 0; i < _ATTR_CNT; ++i) {
 		rc = smbb_charger_attr_parse(chg, i);
 		if (rc) {
@@ -879,21 +1271,51 @@ static int smbb_charger_probe(struct platform_device *pdev)
 		}
 	}
 
+	chg->bat_desc = bat_psy_desc;
+	bat_props = devm_kmemdup(&pdev->dev, smbb_battery_properties,
+				 sizeof(smbb_battery_properties), GFP_KERNEL);
+	if (!bat_props)
+		return -ENOMEM;
+	chg->bat_desc.properties = bat_props;
+	if (of_property_match_string(pdev->dev.of_node, "io-channel-names",
+				     "vbat") >= 0)
+		bat_props[chg->bat_desc.num_properties++] = POWER_SUPPLY_PROP_VOLTAGE_NOW;
+	chg->superman_batt_therm = of_machine_is_compatible("nokia,superman") &&
+		of_property_read_bool(pdev->dev.of_node,
+				      "nokia,superman-batt-thermistor") &&
+		of_property_match_string(pdev->dev.of_node, "io-channel-names",
+					 "batt-therm") >= 0;
+	if (chg->superman_batt_therm)
+		bat_props[chg->bat_desc.num_properties++] = POWER_SUPPLY_PROP_TEMP;
+
+	if (smbb_superman_no_bif(chg)) {
+		bat_props[chg->bat_desc.num_properties++] = POWER_SUPPLY_PROP_MODEL_NAME;
+		bat_props[chg->bat_desc.num_properties++] = POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN;
+		bat_props[chg->bat_desc.num_properties++] = POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN;
+		if (of_property_match_string(pdev->dev.of_node, "io-channel-names",
+					     "vbat") >= 0)
+			bat_props[chg->bat_desc.num_properties++] = POWER_SUPPLY_PROP_CAPACITY_LEVEL;
+	}
+
 	bat_cfg.drv_data = chg;
 	bat_cfg.fwnode = dev_fwnode(&pdev->dev);
 	chg->bat_psy = devm_power_supply_register(&pdev->dev,
-						  &bat_psy_desc,
+						  &chg->bat_desc,
 						  &bat_cfg);
 	if (IS_ERR(chg->bat_psy)) {
 		dev_err(&pdev->dev, "failed to register battery\n");
 		return PTR_ERR(chg->bat_psy);
 	}
 
+	chg->usb_input_control = smbb_usb_input_supported(chg);
+	chg->usb_desc = usb_psy_desc;
+	if (chg->usb_input_control)
+		chg->usb_desc.num_properties++;
 	usb_cfg.drv_data = chg;
 	usb_cfg.supplied_to = smbb_bif;
 	usb_cfg.num_supplicants = ARRAY_SIZE(smbb_bif);
 	chg->usb_psy = devm_power_supply_register(&pdev->dev,
-						  &usb_psy_desc,
+						  &chg->usb_desc,
 						  &usb_cfg);
 	if (IS_ERR(chg->usb_psy)) {
 		dev_err(&pdev->dev, "failed to register USB power supply\n");
@@ -983,6 +1405,10 @@ static int smbb_charger_probe(struct platform_device *pdev)
 	for (i = 0; i < ARRAY_SIZE(smbb_charger_setup); ++i) {
 		const struct reg_off_mask_default *r = &smbb_charger_setup[i];
 
+		/* Superman waits for the monitored stock NTC window before charging. */
+		if (smbb_superman_no_bif(chg) && r->offset == SMBB_CHG_CTRL)
+			continue;
+
 		if (r->rev_mask & BIT(chg->revision))
 			continue;
 
@@ -996,6 +1422,10 @@ static int smbb_charger_probe(struct platform_device *pdev)
 	}
 
 	platform_set_drvdata(pdev, chg);
+	if (smbb_superman_no_bif(chg)) {
+		INIT_DELAYED_WORK(&chg->temp_work, smbb_superman_temp_work);
+		queue_delayed_work(system_freezable_wq, &chg->temp_work, 0);
+	}
 
 	return 0;
 }
@@ -1005,6 +1435,8 @@ static void smbb_charger_remove(struct platform_device *pdev)
 	struct smbb_charger *chg;
 
 	chg = platform_get_drvdata(pdev);
+	if (smbb_superman_no_bif(chg))
+		cancel_delayed_work_sync(&chg->temp_work);
 
 	regmap_update_bits(chg->regmap, chg->addr + SMBB_CHG_CTRL, CTRL_EN, 0);
 }
@@ -1022,6 +1454,7 @@ static struct platform_driver smbb_charger_driver = {
 	.driver = {
 		.name = "qcom-smbb",
 		.of_match_table = smbb_charger_id_table,
+		.pm = &smbb_superman_pm_ops,
 	},
 };
 module_platform_driver(smbb_charger_driver);
