@@ -12,10 +12,12 @@
 #include <linux/kernel.h>
 #include <linux/mutex.h>
 #include <linux/module.h>
+#include <linux/math64.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
+#include "superman-iadc-current.h"
 
 /* IADC register and bit definition */
 #define IADC_REVISION2				0x1
@@ -193,6 +195,15 @@ static void iadc_status_show(struct iadc_chip *iadc)
 		mode, en, chan, dig, req, sta1);
 }
 
+static int iadc_write_verify(struct iadc_chip *iadc,u16 reg,u8 data)
+{
+ u8 check;int ret=iadc_write(iadc,reg,data);
+ if(ret)return ret;
+ ret=iadc_read(iadc,reg,&check);
+ if(ret)return ret;
+ if(check!=data){dev_err(iadc->dev,"write verification reg=%x requested=%02x read=%02x\n",reg,data,check);return -EIO;}
+ return 0;
+}
 static int iadc_configure(struct iadc_chip *iadc, int channel)
 {
 	u8 decim, mode;
@@ -200,34 +211,34 @@ static int iadc_configure(struct iadc_chip *iadc, int channel)
 
 	/* Mode selection */
 	mode = (IADC_OP_MODE_NORMAL << IADC_OP_MODE_SHIFT) | IADC_TRIM_EN;
-	ret = iadc_write(iadc, IADC_MODE_CTL, mode);
+	ret = iadc_write_verify(iadc, IADC_MODE_CTL, mode);
 	if (ret < 0)
 		return ret;
 
 	/* Channel selection */
-	ret = iadc_write(iadc, IADC_CH_SEL_CTL, channel);
+	ret = iadc_write_verify(iadc, IADC_CH_SEL_CTL, channel);
 	if (ret < 0)
 		return ret;
 
 	/* Digital parameter setup */
 	decim = IADC_DEF_DECIMATION << IADC_DIG_DEC_RATIO_SEL_SHIFT;
-	ret = iadc_write(iadc, IADC_DIG_PARAM, decim);
+	ret = iadc_write_verify(iadc, IADC_DIG_PARAM, decim);
 	if (ret < 0)
 		return ret;
 
 	/* HW settle time delay */
-	ret = iadc_write(iadc, IADC_HW_SETTLE_DELAY, IADC_DEF_HW_SETTLE_TIME);
+	ret = iadc_write_verify(iadc, IADC_HW_SETTLE_DELAY, IADC_DEF_HW_SETTLE_TIME);
 	if (ret < 0)
 		return ret;
 
-	ret = iadc_write(iadc, IADC_FAST_AVG_CTL, IADC_DEF_AVG_SAMPLES);
+	ret = iadc_write_verify(iadc, IADC_FAST_AVG_CTL, IADC_DEF_AVG_SAMPLES);
 	if (ret < 0)
 		return ret;
 
 	if (IADC_DEF_AVG_SAMPLES)
-		ret = iadc_write(iadc, IADC_FAST_AVG_EN, IADC_FAST_AVG_EN_SET);
+		ret = iadc_write_verify(iadc, IADC_FAST_AVG_EN, IADC_FAST_AVG_EN_SET);
 	else
-		ret = iadc_write(iadc, IADC_FAST_AVG_EN, 0);
+		ret = iadc_write_verify(iadc, IADC_FAST_AVG_EN, 0);
 
 	if (ret < 0)
 		return ret;
@@ -299,11 +310,25 @@ static int iadc_do_conversion(struct iadc_chip *iadc, int chan, u16 *data)
 	if (!ret)
 		ret = iadc_read_result(iadc, data);
 exit:
-	iadc_set_state(iadc, false);
+ { int stop=iadc_set_state(iadc,false); if(!ret && stop)ret=stop; }
 	if (ret < 0)
 		dev_err(iadc->dev, "conversion failed\n");
 
 	return ret;
+}
+
+/* ADC offset is bipolar; microvolts/micro-ohms must be converted to microamps. */
+static int iadc_raw_to_current(u16 raw, u16 offset, u16 gain, u32 rsense, int *ua)
+{
+ s32 delta = (s32)raw - offset;
+ s32 span = (s32)gain - offset;
+ s64 scaled_ua;
+ if (span <= 0 || !rsense) return -ERANGE;
+ scaled_ua = div64_s64((s64)delta * IADC_REF_GAIN_MICRO_VOLTS * 1000000,
+                     (s64)span * rsense);
+ if (scaled_ua > INT_MAX || scaled_ua < INT_MIN) return -ERANGE;
+ *ua = (int)scaled_ua;
+ return 0;
 }
 
 static int iadc_read_raw(struct iio_dev *indio_dev,
@@ -311,8 +336,8 @@ static int iadc_read_raw(struct iio_dev *indio_dev,
 			 int *val, int *val2, long mask)
 {
 	struct iadc_chip *iadc = iio_priv(indio_dev);
-	s32 isense_ua, vsense_uv;
-	u16 adc_raw, vsense_raw;
+	s32 isense_ua;
+	u16 adc_raw;
 	int ret;
 
 	switch (mask) {
@@ -323,17 +348,11 @@ static int iadc_read_raw(struct iio_dev *indio_dev,
 		if (ret < 0)
 			return ret;
 
-		vsense_raw = adc_raw - iadc->offset[chan->channel];
+		ret = iadc_raw_to_current(adc_raw, iadc->offset[chan->channel],
+                    iadc->gain, iadc->rsense[chan->channel], &isense_ua);
+        if (ret) return ret;
 
-		vsense_uv = vsense_raw * IADC_REF_GAIN_MICRO_VOLTS;
-		vsense_uv /= (s32)iadc->gain - iadc->offset[chan->channel];
-
-		isense_ua = vsense_uv / iadc->rsense[chan->channel];
-
-		dev_dbg(iadc->dev, "off %d gain %d adc %d %duV I %duA\n",
-			iadc->offset[chan->channel], iadc->gain,
-			adc_raw, vsense_uv, isense_ua);
-
+		dev_dbg(iadc->dev, "sample raw=%u offset=%u gain=%u rsense_uohm=%u current_uA=%d\n", adc_raw, iadc->offset[chan->channel], iadc->gain, iadc->rsense[chan->channel], isense_ua);
 		*val = isense_ua;
 		return IIO_VAL_INT;
 	case IIO_CHAN_INFO_SCALE:
@@ -481,6 +500,26 @@ static const struct iio_chan_spec iadc_channels[] = {
 	},
 };
 
+/* Public consumer entry point: serialize conversion against provider removal. */
+int superman_iadc_current_ua(struct device *dev,int *ua)
+{
+ struct iio_dev *indio;int ret,value;
+ if(!dev||!ua)return -EINVAL;
+ device_lock(dev);
+ if(!dev->driver||strcmp(dev->driver->name,"qcom-spmi-iadc")){ret=-ENODEV;goto out;}
+ indio=dev_get_drvdata(dev);
+ if(!indio||indio->dev.parent!=dev||indio->num_channels!=ARRAY_SIZE(iadc_channels)){ret=-ENODEV;goto out;}
+ ret=iadc_read_raw(indio,&iadc_channels[IADC_INT_RSENSE],&value,NULL,IIO_CHAN_INFO_RAW);
+ if(ret==IIO_VAL_INT){*ua=value;ret=0;}else if(ret>=0)ret=-EPROTO;
+ out:device_unlock(dev);return ret;
+}
+EXPORT_SYMBOL_GPL(superman_iadc_current_ua);
+
+static void iadc_disable_irq_wake(void *data)
+{
+ disable_irq_wake((unsigned long)data);
+}
+
 static int iadc_probe(struct platform_device *pdev)
 {
 	struct device_node *node = pdev->dev.of_node;
@@ -538,10 +577,12 @@ static int iadc_probe(struct platform_device *pdev)
 	if (!iadc->poll_eoc) {
 		ret = devm_request_irq(dev, irq_eoc, iadc_isr, 0,
 					"spmi-iadc", iadc);
-		if (!ret)
-			enable_irq_wake(irq_eoc);
-		else
-			return ret;
+		if (ret) return ret;
+        ret = enable_irq_wake(irq_eoc);
+        if (ret) return ret;
+        ret = devm_add_action_or_reset(dev, iadc_disable_irq_wake,
+                                      (void *)(unsigned long)irq_eoc);
+        if (ret) return ret;
 	} else {
 		ret = devm_device_init_wakeup(iadc->dev);
 		if (ret)
@@ -560,7 +601,10 @@ static int iadc_probe(struct platform_device *pdev)
 	indio_dev->channels = iadc_channels;
 	indio_dev->num_channels = ARRAY_SIZE(iadc_channels);
 
-	return devm_iio_device_register(dev, indio_dev);
+	platform_set_drvdata(pdev,indio_dev);
+ ret=devm_iio_device_register(dev,indio_dev);
+ if(ret)platform_set_drvdata(pdev,NULL);
+ return ret;
 }
 
 static const struct of_device_id iadc_match_table[] = {
