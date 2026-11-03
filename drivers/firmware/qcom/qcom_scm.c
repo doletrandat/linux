@@ -21,6 +21,8 @@
 #include <linux/kstrtox.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <crypto/sha2.h>
+#include <linux/unaligned.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
@@ -575,6 +577,197 @@ static void qcom_scm_set_download_mode(u32 dload_mode)
  * track the metadata allocation, this needs to be released by invoking
  * qcom_scm_pas_metadata_release() by the caller.
  */
+
+/* Exact Superman stock MBA SSD v2 envelope. Normal TZ verification/decryption;
+ * no key installation, key extraction, authentication bypass or peripheral boot.
+ * ABI: Qualcomm LK 7042fa3 platform/msm_shared/{scm.c,include/scm.h}.
+ */
+#define SUPERMAN_SSD_SIZE 238148
+#define SUPERMAN_SSD_XML_SIZE 1764
+static DEFINE_MUTEX(superman_ssd_lock);
+int qcom_scm_superman_ssd_available(void);
+int qcom_scm_superman_mba_decrypt(const void *encrypted, size_t len,
+                                void *plain, size_t *plain_len, u32 *stage_status);
+int qcom_scm_superman_ssd_available(void)
+{
+ if (!of_machine_is_compatible("nokia,superman") ||
+     !of_machine_is_compatible("qcom,msm8226")) return -ENODEV;
+ if (!__scm) return -EPROBE_DEFER;
+ /* The referenced command-buffer ABI is legacy-only. */
+ if (__get_convention()!=SMC_CONVENTION_LEGACY) return -EOPNOTSUPP;
+ return (__qcom_scm_is_call_available(__scm->dev,7,6)?1:0) |
+        (__qcom_scm_is_call_available(__scm->dev,7,7)?2:0);
+}
+EXPORT_SYMBOL_GPL(qcom_scm_superman_ssd_available);
+int qcom_scm_superman_mba_decrypt(const void *encrypted, size_t len,
+                                void *plain, size_t *plain_len, u32 *stage_status)
+{
+ static const u8 expected[32]={0x13,0x68,0xec,0xe2,0x6d,0xe9,0x44,0xcb,0xad,0x5f,0x97,0x00,0xad,0x85,0x96,0x6f,0xf5,0xd9,0xff,0xc8,0x26,0x89,0xdf,0x80,0x38,0x2c,0x05,0x54,0xd5,0xa0,0xdd,0xa0};
+ u8 digest[32];void *buf;dma_addr_t phys;u32 ctx;int ret;size_t md_len;
+ struct qcom_scm_desc desc={.svc=7,.owner=ARM_SMCCC_OWNER_SIP};
+ struct qcom_scm_res res={0};
+ if (!encrypted || !plain || !plain_len || !stage_status ||
+     len!=SUPERMAN_SSD_SIZE || *plain_len < len-SUPERMAN_SSD_XML_SIZE) return -EINVAL;
+ *stage_status=0xffffffff;
+ sha256(encrypted,len,digest);
+ if (memcmp(digest,expected,sizeof(digest))) return -EKEYREJECTED;
+ ret=qcom_scm_superman_ssd_available();
+ if (ret<0) return ret;
+ if (ret!=3) return -EOPNOTSUPP;
+ buf=dma_alloc_coherent(__scm->dev,len,&phys,GFP_KERNEL);
+ if(!buf)return -ENOMEM;
+ if(phys>U32_MAX || len>U32_MAX-phys){ret=-EOVERFLOW;goto free;}
+ memcpy(buf,encrypted,len);
+ mutex_lock(&superman_ssd_lock);
+ ret=qcom_scm_clk_enable();if(ret)goto unlock;
+ ret=qcom_scm_bw_enable();if(ret)goto clocks;
+ /* Match the bounded growing-metadata protocol, without reading past input. */
+ for(md_len=128;md_len<=2048;md_len*=2){
+  desc.cmd=6;desc.arginfo=QCOM_SCM_ARGS(2,QCOM_SCM_VAL,QCOM_SCM_RW);
+  desc.args[0]=md_len;desc.args[1]=phys;
+  memset(&res,0,sizeof(res));
+  ret=qcom_scm_call(__scm->dev,&desc,&res);if(ret)goto bandwidth;
+  *stage_status=0x10000 | (u32)res.result[0];
+  if(res.result[0]!=6)break;
+ }
+ if(res.result[0]){ret=-EKEYREJECTED;goto bandwidth;}
+ /* No firmware-returned pointer is dereferenced without exact bounds. */
+ if(res.result[2]!=phys+SUPERMAN_SSD_XML_SIZE){ret=-ERANGE;goto bandwidth;}
+ ctx=res.result[1];
+ desc.cmd=7;desc.arginfo=QCOM_SCM_ARGS(4,QCOM_SCM_VAL,QCOM_SCM_VAL,QCOM_SCM_VAL,QCOM_SCM_RW);
+ desc.args[0]=ctx;desc.args[1]=1;desc.args[2]=len-SUPERMAN_SSD_XML_SIZE;desc.args[3]=phys+SUPERMAN_SSD_XML_SIZE;
+ memset(&res,0,sizeof(res));
+ ret=qcom_scm_call(__scm->dev,&desc,&res);if(ret)goto bandwidth;
+ *stage_status=0x20000 | (u32)res.result[0];
+ if(res.result[0]){ret=-EKEYREJECTED;goto bandwidth;}
+ *plain_len=len-SUPERMAN_SSD_XML_SIZE;
+ memcpy(plain,buf+SUPERMAN_SSD_XML_SIZE,*plain_len);
+ ret=0;
+bandwidth:qcom_scm_bw_disable();
+clocks:qcom_scm_clk_disable();
+unlock:mutex_unlock(&superman_ssd_lock);
+free:memzero_explicit(buf,len);dma_free_coherent(__scm->dev,len,buf,phys);
+ return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_scm_superman_mba_decrypt);
+/* Original Superman MPSS, normal SSD ELF-segment service (svc 7/cmd 8).
+ * The signed segment hashes must all match before any plaintext is returned.
+ * No peripheral start, key operation, NV access or authentication bypass.
+ */
+#define SUPERMAN_MPSS_SIZE 30984015
+#define SUPERMAN_MPSS_MD 0x2d08
+#define SUPERMAN_MPSS_MD_SIZE 1764
+#define SUPERMAN_SSD_CHUNK 65536
+int qcom_scm_superman_mpss_decrypt(const void *encrypted, size_t len,
+                                 void *plain, u32 *stage_status);
+int qcom_scm_superman_mpss_decrypt(const void *encrypted, size_t len,
+                                 void *plain, u32 *stage_status)
+{
+ static const u8 expected[32] = {
+  0x9a,0x8a,0x39,0x78,0xcc,0xc7,0x05,0xa2,0x49,0x22,0x89,0x72,0x94,0x5e,0xf7,0xe9,
+  0x7e,0xeb,0xad,0x3f,0x5e,0x34,0x2c,0x86,0x33,0x30,0xd7,0x48,0x01,0xba,0x3c,0xf5
+ };
+ const u8 *in = encrypted;
+ u8 digest[32], *buf, *out = plain;
+ dma_addr_t phys;
+ struct qcom_scm_desc desc = {.svc=7,.owner=ARM_SMCCC_OWNER_SIP};
+ struct qcom_scm_res res = {0};
+ u32 ctx, i, off, bytes, flags, segment_num = 0, hash_failure = 0;
+ size_t md_len, pos, chunk;
+ int ret;
+
+ if (!encrypted || !plain || encrypted == plain || !stage_status ||
+     len != SUPERMAN_MPSS_SIZE) return -EINVAL;
+ *stage_status = 0xffffffff;
+ sha256(in, len, digest);
+ if (memcmp(digest, expected, 32)) return -EKEYREJECTED;
+ ret = qcom_scm_superman_ssd_available();
+ if (ret < 0) return ret;
+ if (ret != 3 || !__qcom_scm_is_call_available(__scm->dev, 7, 8))
+  return -EOPNOTSUPP;
+ /* Pinned ELF has 31 headers, final nonempty code segment 29. */
+ if (get_unaligned_le16(in + 44) != 31) return -EINVAL;
+ buf = dma_alloc_coherent(__scm->dev, SUPERMAN_SSD_CHUNK, &phys, GFP_KERNEL);
+ if (!buf) return -ENOMEM;
+ if (phys > U32_MAX || SUPERMAN_SSD_CHUNK > U32_MAX - phys) {
+  ret = -EOVERFLOW; goto free;
+ }
+ mutex_lock(&superman_ssd_lock);
+ ret = qcom_scm_clk_enable(); if (ret) goto unlock;
+ ret = qcom_scm_bw_enable(); if (ret) goto clocks;
+ memset(buf, 0, SUPERMAN_SSD_CHUNK);
+ memcpy(buf, in + SUPERMAN_MPSS_MD, SUPERMAN_MPSS_MD_SIZE);
+ for (md_len = 128; md_len <= 2048; md_len *= 2) {
+  desc.cmd = 6;
+  desc.arginfo = QCOM_SCM_ARGS(2, QCOM_SCM_VAL, QCOM_SCM_RW);
+  desc.args[0] = md_len; desc.args[1] = phys;
+  memset(&res, 0, sizeof(res));
+  ret = qcom_scm_call(__scm->dev, &desc, &res);
+  if (ret) goto bandwidth;
+  *stage_status = 0x10000 | (u32)res.result[0];
+  if (res.result[0] != 6) break;
+ }
+ if (res.result[0]) { ret = -EKEYREJECTED; goto bandwidth; }
+ if (res.result[2] != phys + SUPERMAN_MPSS_MD_SIZE) {
+  ret = -ERANGE; goto bandwidth;
+ }
+ ctx = res.result[1];
+ memcpy(out, in, len);
+ for (i = 3; i < 31; i++) {
+  const u8 *ph = in + 52 + 32 * i;
+  off = get_unaligned_le32(ph + 4);
+  bytes = get_unaligned_le32(ph + 16);
+  flags = get_unaligned_le32(ph + 24);
+  if (get_unaligned_le32(ph) != 1 ||
+      ((flags >> 24) & 7) == 2) continue;
+  /* SSD uses zero-based PT_LOAD numbering, including empty segments. */
+  if (!bytes) { segment_num++; continue; }
+  if (off > len || bytes > len - off || i > 29) {
+   ret = -EINVAL; goto wipe;
+  }
+  for (pos = 0; pos < bytes; pos += chunk) {
+   chunk = min_t(size_t, bytes - pos, SUPERMAN_SSD_CHUNK);
+   memcpy(buf, in + off + pos, chunk);
+   desc.cmd = 8;
+   desc.arginfo = QCOM_SCM_ARGS(6, QCOM_SCM_VAL, QCOM_SCM_VAL,
+      QCOM_SCM_VAL, QCOM_SCM_VAL, QCOM_SCM_VAL, QCOM_SCM_RW);
+   desc.args[0] = ctx; desc.args[1] = segment_num; desc.args[2] = i == 29;
+   desc.args[3] = pos + chunk == bytes; desc.args[4] = chunk;
+   desc.args[5] = phys;
+   memset(&res, 0, sizeof(res));
+   ret = qcom_scm_call(__scm->dev, &desc, &res);
+   *stage_status = 0x20000000 | (i << 16) | (u32)res.result[0];
+   if (ret) goto wipe;
+   if (res.result[0]) { ret = -EKEYREJECTED; goto wipe; }
+   memcpy(out + off + pos, buf, chunk);
+  }
+  sha256(out + off, bytes, digest);
+  if (memcmp(digest, in + 0x1028 + 32 * i, 32)) {
+   if (!hash_failure) hash_failure = 0x30000000 | (i << 16);
+  }
+  segment_num++;
+ }
+ if (hash_failure) {
+  *stage_status = hash_failure; ret = -EKEYREJECTED; goto wipe;
+ }
+ ret = 0;
+ goto bandwidth;
+wipe:
+ memzero_explicit(out, len);
+bandwidth:
+ qcom_scm_bw_disable();
+clocks:
+ qcom_scm_clk_disable();
+unlock:
+ mutex_unlock(&superman_ssd_lock);
+free:
+ memzero_explicit(buf, SUPERMAN_SSD_CHUNK);
+ dma_free_coherent(__scm->dev, SUPERMAN_SSD_CHUNK, buf, phys);
+ return ret;
+}
+EXPORT_SYMBOL_GPL(qcom_scm_superman_mpss_decrypt);
+
+
 int qcom_scm_pas_init_image(u32 peripheral, const void *metadata, size_t size,
 			    struct qcom_scm_pas_metadata *ctx)
 {
