@@ -34,6 +34,9 @@
 #include <drm/msm_drm.h>
 #include <drm/drm_gem.h>
 
+/* Explicit module-only mode that leaves display drivers unregistered. */
+extern bool msm_render_only;
+
 extern struct fault_attr fail_gem_alloc;
 extern struct fault_attr fail_gem_iova;
 

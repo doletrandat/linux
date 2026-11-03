@@ -55,8 +55,8 @@ TRACE_EVENT(msm_gpu_submit_flush,
 
 TRACE_EVENT(msm_gpu_submit_retired,
 	    TP_PROTO(struct msm_gem_submit *submit, u64 elapsed, u64 clock,
-		    u64 start, u64 end),
-	    TP_ARGS(submit, elapsed, clock, start, end),
+		    u64 start, u64 end, bool stats_valid),
+	    TP_ARGS(submit, elapsed, clock, start, end, stats_valid),
 	    TP_STRUCT__entry(
 		    __field(pid_t, pid)
 		    __field(u32, id)
@@ -66,6 +66,7 @@ TRACE_EVENT(msm_gpu_submit_retired,
 		    __field(u64, clock)
 		    __field(u64, start_ticks)
 		    __field(u64, end_ticks)
+		    __field(bool, stats_valid)
 		    ),
 	    TP_fast_assign(
 		    __entry->pid = pid_nr(submit->pid);
@@ -76,11 +77,12 @@ TRACE_EVENT(msm_gpu_submit_retired,
 		    __entry->clock = clock;
 		    __entry->start_ticks = start;
 		    __entry->end_ticks = end;
+		    __entry->stats_valid = stats_valid;
 		    ),
-	    TP_printk("id=%d pid=%d ring=%d:%d elapsed=%lld ns mhz=%lld start=%lld end=%lld",
+	    TP_printk("id=%d pid=%d ring=%d:%d elapsed=%lld ns mhz=%lld start=%lld end=%lld stats_valid=%d",
 		    __entry->id, __entry->pid, __entry->ringid, __entry->seqno,
 		    __entry->elapsed, __entry->clock,
-		    __entry->start_ticks, __entry->end_ticks)
+		    __entry->start_ticks, __entry->end_ticks, __entry->stats_valid)
 );
 
 

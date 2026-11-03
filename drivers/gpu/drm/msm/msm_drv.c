@@ -46,6 +46,10 @@
 #define MSM_VERSION_MINOR	12
 #define MSM_VERSION_PATCHLEVEL	0
 
+bool msm_render_only;
+module_param_named(render_only, msm_render_only, bool, 0444);
+MODULE_PARM_DESC(render_only, "Register only the GPU; leave display hardware untouched");
+
 static void msm_deinit_vram(struct drm_device *ddev);
 
 static char *vram = "16m";
@@ -118,9 +122,16 @@ bool msm_use_mmu(struct drm_device *dev)
 	 * On other platforms IOMMU can be declared specified either for the
 	 * MDP/DPU device or for its parent, MDSS device.
 	 */
-	return priv->is_a2xx ||
-		device_iommu_mapped(dev->dev) ||
-		device_iommu_mapped(dev->dev->parent);
+	/* Render-only DRM registers a synthetic parent without an IOMMU.
+     * Once the GPU is loaded, its actual address-space determines whether
+     * page-backed GEM and external PRIME imports can be used. Do not force
+     * them into the fallback VRAM pool merely because KMS is absent.
+     * Before GPU initialization, retain the existing carveout fallback.
+     */
+    return (msm_render_only && priv->gpu && priv->gpu->aspace &&
+            priv->gpu->aspace->mmu) || priv->is_a2xx ||
+        device_iommu_mapped(dev->dev) ||
+        device_iommu_mapped(dev->dev->parent);
 }
 
 static int msm_init_vram(struct drm_device *dev)
@@ -1123,10 +1134,22 @@ static struct platform_driver msm_platform_driver = {
 
 static int __init msm_drm_register(void)
 {
+	int ret;
+
 	if (!modeset)
 		return -EINVAL;
 
 	DBG("init");
+	if (msm_render_only) {
+		ret = adreno_register();
+		if (ret)
+			return ret;
+		ret = platform_driver_register(&msm_platform_driver);
+		if (ret)
+			adreno_unregister();
+		return ret;
+	}
+
 	msm_mdp_register();
 	msm_dpu_register();
 	msm_dsi_register();
@@ -1142,6 +1165,10 @@ static void __exit msm_drm_unregister(void)
 {
 	DBG("fini");
 	platform_driver_unregister(&msm_platform_driver);
+	if (msm_render_only) {
+		adreno_unregister();
+		return;
+	}
 	msm_mdss_unregister();
 	msm_mdp4_unregister();
 	msm_dp_unregister();

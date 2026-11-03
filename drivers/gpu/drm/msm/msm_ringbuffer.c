@@ -6,6 +6,7 @@
 
 #include "msm_ringbuffer.h"
 #include "msm_gpu.h"
+#include "msm_mmu.h"
 
 static uint num_hw_submissions = 8;
 MODULE_PARM_DESC(num_hw_submissions, "The max # of jobs to write into ringbuffer (default 8)");
@@ -17,7 +18,7 @@ static struct dma_fence *msm_job_run(struct drm_sched_job *job)
 	struct msm_fence_context *fctx = submit->ring->fctx;
 	struct msm_gpu *gpu = submit->gpu;
 	struct msm_drm_private *priv = gpu->dev->dev_private;
-	int i;
+	int i, ret;
 
 	msm_fence_init(submit->hw_fence, fctx);
 
@@ -36,9 +37,17 @@ static struct dma_fence *msm_job_run(struct drm_sched_job *job)
 	/* TODO move submit path over to using a per-ring lock.. */
 	mutex_lock(&gpu->lock);
 
-	msm_gpu_submit(gpu, submit);
+	/* Queued work may have been mapped before the sticky IOMMU failure. */
+	if (msm_mmu_is_faulted(gpu->aspace ? gpu->aspace->mmu : NULL) ||
+	    msm_mmu_is_faulted(submit->aspace ? submit->aspace->mmu : NULL)) {
+		mutex_unlock(&gpu->lock);
+		return ERR_PTR(-EIO);
+	}
+	ret = msm_gpu_submit(gpu, submit);
 
 	mutex_unlock(&gpu->lock);
+	if (ret)
+		return ERR_PTR(ret);
 
 	return dma_fence_get(submit->hw_fence);
 }

@@ -10,6 +10,7 @@
 #include <linux/iommu.h>
 
 struct msm_mmu_funcs {
+	bool (*is_faulted)(struct msm_mmu *mmu);
 	void (*detach)(struct msm_mmu *mmu);
 	int (*map)(struct msm_mmu *mmu, uint64_t iova, struct sg_table *sgt,
 			size_t len, int prot);
@@ -31,6 +32,11 @@ struct msm_mmu {
 	void *arg;
 	enum msm_mmu_type type;
 };
+
+static inline bool msm_mmu_is_faulted(struct msm_mmu *mmu)
+{
+	return mmu && mmu->funcs->is_faulted && mmu->funcs->is_faulted(mmu);
+}
 
 static inline void msm_mmu_init(struct msm_mmu *mmu, struct device *dev,
 		const struct msm_mmu_funcs *funcs, enum msm_mmu_type type)

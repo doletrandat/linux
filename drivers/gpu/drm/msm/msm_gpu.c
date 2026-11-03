@@ -18,6 +18,30 @@
 #include <linux/devcoredump.h>
 #include <linux/sched/task.h>
 
+/* Diagnostic messages use existing software state, not extra register reads. */
+static bool superman_diag = true;
+module_param(superman_diag, bool, 0400);
+MODULE_PARM_DESC(superman_diag, "Bounded Superman GPU diagnostic events");
+static atomic_t superman_gpu_events = ATOMIC_INIT(0);
+void msm_gpu_diag(struct msm_gpu *gpu, const char *stage, int ret, u32 value)
+{
+ unsigned int seq;
+ if (!superman_diag || !gpu || !gpu->pdev)
+  return;
+ seq = atomic_inc_return(&superman_gpu_events);
+ if (ret) {
+  dev_err_ratelimited(&gpu->pdev->dev,
+   "SUPERMAN_GPU seq=%u stage=%s ret=%d value=0x%x needs_init=%d\n",
+   seq, stage, ret, value, gpu->needs_hw_init);
+ } else if (seq <= 256) {
+  dev_info(&gpu->pdev->dev,
+   "SUPERMAN_GPU seq=%u stage=%s ret=0 value=0x%x needs_init=%d\n",
+   seq, stage, value, gpu->needs_hw_init);
+ } else if (seq == 257) {
+  dev_info(&gpu->pdev->dev, "SUPERMAN_GPU success event budget exhausted; errors remain enabled\n");
+ }
+}
+
 /*
  * Power Management:
  */
@@ -39,6 +63,8 @@ static int enable_pwrrail(struct msm_gpu *gpu)
 		ret = regulator_enable(gpu->gpu_cx);
 		if (ret) {
 			DRM_DEV_ERROR(dev->dev, "failed to enable 'gpu_cx': %d\n", ret);
+			if (gpu->gpu_reg)
+				regulator_disable(gpu->gpu_reg);
 			return ret;
 		}
 	}
@@ -57,14 +83,26 @@ static int disable_pwrrail(struct msm_gpu *gpu)
 
 static int enable_clk(struct msm_gpu *gpu)
 {
-	if (gpu->core_clk && gpu->fast_rate)
-		dev_pm_opp_set_rate(&gpu->pdev->dev, gpu->fast_rate);
+	int ret;
+
+	if (gpu->core_clk && gpu->fast_rate) {
+		ret = dev_pm_opp_set_rate(&gpu->pdev->dev, gpu->fast_rate);
+		msm_gpu_diag(gpu, "opp_set_rate", ret, gpu->fast_rate);
+		if (ret)
+			return ret;
+	}
 
 	/* Set the RBBM timer rate to 19.2Mhz */
-	if (gpu->rbbmtimer_clk)
-		clk_set_rate(gpu->rbbmtimer_clk, 19200000);
+	if (gpu->rbbmtimer_clk) {
+		ret = clk_set_rate(gpu->rbbmtimer_clk, 19200000);
+		msm_gpu_diag(gpu, "rbbm_rate", ret, 19200000);
+		if (ret)
+			return ret;
+	}
 
-	return clk_bulk_prepare_enable(gpu->nr_clocks, gpu->grp_clks);
+	ret = clk_bulk_prepare_enable(gpu->nr_clocks, gpu->grp_clks);
+	msm_gpu_diag(gpu, "bulk_clocks", ret, gpu->nr_clocks);
+	return ret;
 }
 
 static int disable_clk(struct msm_gpu *gpu)
@@ -103,23 +141,35 @@ int msm_gpu_pm_resume(struct msm_gpu *gpu)
 	DBG("%s", gpu->name);
 	trace_msm_gpu_resume(0);
 
+	msm_gpu_diag(gpu, "resume_begin", 0, 0);
 	ret = enable_pwrrail(gpu);
+	msm_gpu_diag(gpu, "power_rails", ret, 0);
 	if (ret)
 		return ret;
 
 	ret = enable_clk(gpu);
+	msm_gpu_diag(gpu, "clocks_resume", ret, 0);
 	if (ret)
-		return ret;
+		goto err_pwrrail;
 
 	ret = enable_axi(gpu);
+	msm_gpu_diag(gpu, "axi_resume", ret, 0);
 	if (ret)
-		return ret;
+		goto err_clk;
 
 	msm_devfreq_resume(gpu);
 
 	gpu->needs_hw_init = true;
+	msm_gpu_diag(gpu, "resume_end", 0, 0);
 
 	return 0;
+
+err_clk:
+	disable_clk(gpu);
+err_pwrrail:
+	msm_gpu_diag(gpu, "resume_unwind", ret, 0);
+	disable_pwrrail(gpu);
+	return ret;
 }
 
 int msm_gpu_pm_suspend(struct msm_gpu *gpu)
@@ -129,6 +179,7 @@ int msm_gpu_pm_suspend(struct msm_gpu *gpu)
 	DBG("%s", gpu->name);
 	trace_msm_gpu_suspend(0);
 
+	msm_gpu_diag(gpu, "suspend_begin", 0, 0);
 	msm_devfreq_suspend(gpu);
 
 	ret = disable_axi(gpu);
@@ -144,6 +195,7 @@ int msm_gpu_pm_suspend(struct msm_gpu *gpu)
 		return ret;
 
 	gpu->suspend_count++;
+	msm_gpu_diag(gpu, "suspend_end", 0, gpu->suspend_count);
 
 	return 0;
 }
@@ -165,12 +217,14 @@ int msm_gpu_hw_init(struct msm_gpu *gpu)
 	if (!gpu->needs_hw_init)
 		return 0;
 
+	msm_gpu_diag(gpu, "hw_init_begin", 0, 0);
 	disable_irq(gpu->irq);
 	ret = gpu->funcs->hw_init(gpu);
 	if (!ret)
 		gpu->needs_hw_init = false;
 	enable_irq(gpu->irq);
 
+	msm_gpu_diag(gpu, "hw_init_end", ret, 0);
 	return ret;
 }
 
@@ -370,11 +424,21 @@ static void recover_worker(struct kthread_work *work)
 	struct drm_device *dev = gpu->dev;
 	struct msm_drm_private *priv = dev->dev_private;
 	struct msm_gem_submit *submit;
-	struct msm_ringbuffer *cur_ring = gpu->funcs->active_ring(gpu);
+	struct msm_ringbuffer *cur_ring;
 	char *comm = NULL, *cmd = NULL;
 	int i;
 
+	msm_gpu_diag(gpu, "recovery_begin", -EIO, 0);
 	mutex_lock(&gpu->lock);
+
+	/* Do not reset/replay against retained, failed translations. */
+	if (msm_mmu_is_faulted(gpu->aspace ? gpu->aspace->mmu : NULL)) {
+		msm_gpu_diag(gpu, "recovery_iommu_blocked", -EIO, 0);
+		DRM_DEV_ERROR(dev->dev, "%s: IOMMU failed; recovery replay blocked\n", gpu->name);
+		mutex_unlock(&gpu->lock);
+		return;
+	}
+	cur_ring = gpu->funcs->active_ring(gpu);
 
 	DRM_DEV_ERROR(dev->dev, "%s: hangcheck recover!\n", gpu->name);
 
@@ -406,8 +470,12 @@ static void recover_worker(struct kthread_work *work)
 		msm_rd_dump_submit(priv->hangrd, submit, NULL);
 	}
 
-	/* Record the crash state */
-	pm_runtime_get_sync(&gpu->pdev->dev);
+	/* Never read GPU registers after a failed power/clock resume. */
+	if (pm_runtime_resume_and_get(&gpu->pdev->dev) < 0) {
+		kfree(cmd);
+		kfree(comm);
+		goto out_unlock;
+	}
 	msm_gpu_crashstate_capture(gpu, submit, NULL, comm, cmd);
 
 	kfree(cmd);
@@ -437,7 +505,12 @@ static void recover_worker(struct kthread_work *work)
 		/* retire completed submits, plus the one that hung: */
 		retire_submits(gpu);
 
+		if (msm_mmu_is_faulted(gpu->aspace ? gpu->aspace->mmu : NULL))
+			goto out_pm_put;
 		gpu->funcs->recover(gpu);
+		if (gpu->needs_hw_init ||
+		    msm_mmu_is_faulted(gpu->aspace ? gpu->aspace->mmu : NULL))
+			goto out_pm_put;
 
 		/*
 		 * Replay all remaining submits starting with highest priority
@@ -448,12 +521,17 @@ static void recover_worker(struct kthread_work *work)
 			unsigned long flags;
 
 			spin_lock_irqsave(&ring->submit_lock, flags);
-			list_for_each_entry(submit, &ring->submits, node)
+			list_for_each_entry(submit, &ring->submits, node) {
+				if (msm_mmu_is_faulted(gpu->aspace ? gpu->aspace->mmu : NULL) ||
+				    msm_mmu_is_faulted(submit->aspace ? submit->aspace->mmu : NULL))
+					break;
 				gpu->funcs->submit(gpu, submit);
+			}
 			spin_unlock_irqrestore(&ring->submit_lock, flags);
 		}
 	}
 
+out_pm_put:
 	pm_runtime_put(&gpu->pdev->dev);
 
 out_unlock:
@@ -484,8 +562,12 @@ void msm_gpu_fault_crashstate_capture(struct msm_gpu *gpu, struct msm_gpu_fault_
 		submit->fault_dumped = true;
 	}
 
-	/* Record the crash state */
-	pm_runtime_get_sync(&gpu->pdev->dev);
+	/* Never read GPU registers after a failed power/clock resume. */
+	if (pm_runtime_resume_and_get(&gpu->pdev->dev) < 0) {
+		kfree(cmd);
+		kfree(comm);
+		goto resume_smmu;
+	}
 	msm_gpu_crashstate_capture(gpu, submit, fault_info, comm, cmd);
 	pm_runtime_put_sync(&gpu->pdev->dev);
 
@@ -657,30 +739,34 @@ out:
 static void retire_submit(struct msm_gpu *gpu, struct msm_ringbuffer *ring,
 		struct msm_gem_submit *submit)
 {
-	int index = submit->seqno % MSM_GPU_SUBMIT_STATS_COUNT;
-	volatile struct msm_gpu_submit_stats *stats;
-	u64 elapsed, clock = 0, cycles;
+	u64 elapsed = 0, clock = 0, cycles = 0, start = 0, end = 0;
 	unsigned long flags;
 
-	stats = &ring->memptrs->stats[index];
-	/* Convert 19.2Mhz alwayson ticks to nanoseconds for elapsed time */
-	elapsed = (stats->alwayson_end - stats->alwayson_start) * 10000;
-	do_div(elapsed, 192);
+	/* A3xx/A4xx/A5xx do not emit these stats. Reading their unwritten
+	 * slots invents timing and corrupts context accounting, even though
+	 * the completion fence itself is valid.
+	 */
+	if (gpu->has_hw_submit_stats) {
+		int index = submit->seqno % MSM_GPU_SUBMIT_STATS_COUNT;
+		volatile struct msm_gpu_submit_stats *stats = &ring->memptrs->stats[index];
 
-	cycles = stats->cpcycles_end - stats->cpcycles_start;
-
-	/* Calculate the clock frequency from the number of CP cycles */
-	if (elapsed) {
-		clock = cycles * 1000;
-		do_div(clock, elapsed);
+		start = stats->alwayson_start;
+		end = stats->alwayson_end;
+		elapsed = (end - start) * 10000;
+		do_div(elapsed, 192);
+		cycles = stats->cpcycles_end - stats->cpcycles_start;
+		if (elapsed) {
+			clock = cycles * 1000;
+			do_div(clock, elapsed);
+		}
+		submit->queue->ctx->elapsed_ns += elapsed;
+		submit->queue->ctx->cycles += cycles;
 	}
 
-	submit->queue->ctx->elapsed_ns += elapsed;
-	submit->queue->ctx->cycles     += cycles;
+	trace_msm_gpu_submit_retired(submit, elapsed, clock, start, end,
+		gpu->has_hw_submit_stats);
 
-	trace_msm_gpu_submit_retired(submit, elapsed, clock,
-		stats->alwayson_start, stats->alwayson_end);
-
+	msm_gpu_diag(gpu, "fence_retired", 0, submit->seqno);
 	msm_submit_retire(submit);
 
 	pm_runtime_mark_last_busy(&gpu->pdev->dev);
@@ -756,16 +842,30 @@ void msm_gpu_retire(struct msm_gpu *gpu)
 }
 
 /* add bo's to gpu's ring, and kick gpu: */
-void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
+int msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 {
 	struct msm_ringbuffer *ring = submit->ring;
 	unsigned long flags;
+	int ret;
 
 	WARN_ON(!mutex_is_locked(&gpu->lock));
 
-	pm_runtime_get_sync(&gpu->pdev->dev);
+	msm_gpu_diag(gpu, "submit_begin", 0, submit->hw_fence->seqno);
+	ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
+	msm_gpu_diag(gpu, "submit_power", ret < 0 ? ret : 0, 0);
+	if (ret < 0)
+		return ret;
 
-	msm_gpu_hw_init(gpu);
+	ret = msm_gpu_hw_init(gpu);
+	if (ret)
+		goto out_pm_put;
+
+	/* Initialization can map buffers and expose an IOMMU sync failure. */
+	if (msm_mmu_is_faulted(gpu->aspace ? gpu->aspace->mmu : NULL) ||
+	    msm_mmu_is_faulted(submit->aspace ? submit->aspace->mmu : NULL)) {
+		ret = -EIO;
+		goto out_pm_put;
+	}
 
 	submit->seqno = submit->hw_fence->seqno;
 
@@ -790,11 +890,19 @@ void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit)
 	gpu->active_submits++;
 	mutex_unlock(&gpu->active_lock);
 
+	msm_gpu_diag(gpu, "submit_kick", 0, submit->seqno);
 	gpu->funcs->submit(gpu, submit);
+	msm_gpu_diag(gpu, "submit_return", 0, submit->seqno);
 	submit->ring->cur_ctx_seqno = submit->queue->ctx->seqno;
 
 	pm_runtime_put(&gpu->pdev->dev);
 	hangcheck_timer_reset(gpu);
+	return 0;
+
+out_pm_put:
+	msm_gpu_diag(gpu, "submit_rejected", ret, 0);
+	pm_runtime_put(&gpu->pdev->dev);
+	return ret;
 }
 
 /*

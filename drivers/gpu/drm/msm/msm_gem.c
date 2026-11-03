@@ -445,21 +445,27 @@ static void del_vma(struct msm_gem_vma *vma)
  * case (!close), we keep the iova allocated, but only remove the iommu
  * mapping.
  */
-static void
+static bool
 put_iova_spaces(struct drm_gem_object *obj, bool close)
 {
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
 	struct msm_gem_vma *vma;
 
 	msm_gem_assert_locked(obj);
+	if (msm_obj->iommu_fault)
+		return false;
 
 	list_for_each_entry(vma, &msm_obj->vmas, list) {
 		if (vma->aspace) {
-			msm_gem_vma_purge(vma);
+			if (msm_gem_vma_purge(vma)) {
+				msm_obj->iommu_fault = true;
+				return false;
+			}
 			if (close)
 				msm_gem_vma_close(vma);
 		}
 	}
+	return true;
 }
 
 /* Called with msm_obj locked */
@@ -484,6 +490,8 @@ static struct msm_gem_vma *get_vma_locked(struct drm_gem_object *obj,
 
 	msm_gem_assert_locked(obj);
 
+	if (to_msm_bo(obj)->iommu_fault)
+		return ERR_PTR(-EIO);
 	vma = lookup_vma(obj, aspace);
 
 	if (!vma) {
@@ -642,7 +650,10 @@ static int clear_iova(struct drm_gem_object *obj,
 	if (!vma)
 		return 0;
 
-	msm_gem_vma_purge(vma);
+	if (msm_gem_vma_purge(vma)) {
+		to_msm_bo(obj)->iommu_fault = true;
+		return -EIO;
+	}
 	msm_gem_vma_close(vma);
 	del_vma(vma);
 
@@ -843,7 +854,7 @@ int msm_gem_madvise(struct drm_gem_object *obj, unsigned madv)
 	return (madv != __MSM_MADV_PURGED);
 }
 
-void msm_gem_purge(struct drm_gem_object *obj)
+bool msm_gem_purge(struct drm_gem_object *obj)
 {
 	struct drm_device *dev = obj->dev;
 	struct msm_drm_private *priv = obj->dev->dev_private;
@@ -853,7 +864,8 @@ void msm_gem_purge(struct drm_gem_object *obj)
 	GEM_WARN_ON(!is_purgeable(msm_obj));
 
 	/* Get rid of any iommu mapping(s): */
-	put_iova_spaces(obj, true);
+	if (!put_iova_spaces(obj, true))
+		return false;
 
 	msm_gem_vunmap(obj);
 
@@ -879,12 +891,13 @@ void msm_gem_purge(struct drm_gem_object *obj)
 
 	invalidate_mapping_pages(file_inode(obj->filp)->i_mapping,
 			0, (loff_t)-1);
+	return true;
 }
 
 /*
  * Unpin the backing pages and make them available to be swapped out.
  */
-void msm_gem_evict(struct drm_gem_object *obj)
+bool msm_gem_evict(struct drm_gem_object *obj)
 {
 	struct drm_device *dev = obj->dev;
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
@@ -893,11 +906,13 @@ void msm_gem_evict(struct drm_gem_object *obj)
 	GEM_WARN_ON(is_unevictable(msm_obj));
 
 	/* Get rid of any iommu mapping(s): */
-	put_iova_spaces(obj, false);
+	if (!put_iova_spaces(obj, false))
+		return false;
 
 	drm_vma_node_unmap(&obj->vma_node, dev->anon_inode->i_mapping);
 
 	put_pages(obj);
+	return true;
 }
 
 void msm_gem_vunmap(struct drm_gem_object *obj)
@@ -1072,7 +1087,12 @@ static void msm_gem_free_object(struct drm_gem_object *obj)
 	list_del(&msm_obj->node);
 	mutex_unlock(&priv->obj_lock);
 
-	put_iova_spaces(obj, true);
+	if (!put_iova_spaces(obj, true)) {
+		/* This zero-ref object is retained, not a reclaimable LRU entry. */
+		drm_gem_lru_remove(obj);
+		dev_err_ratelimited(dev->dev, "retaining GEM backing after IOMMU failure\n");
+		return;
+	}
 
 	if (drm_gem_is_imported(obj)) {
 		GEM_WARN_ON(msm_obj->vaddr);
@@ -1216,6 +1236,10 @@ struct drm_gem_object *msm_gem_new(struct drm_device *dev, uint32_t size, uint32
 		use_vram = true;
 	else if ((flags & (MSM_BO_STOLEN | MSM_BO_SCANOUT)) && priv->vram.size)
 		use_vram = true;
+
+    /* Existing diagnostic budget limits these events; no new global tracing. */
+    if (msm_render_only && priv->gpu)
+        msm_gpu_diag(priv->gpu, use_vram ? "gem_vram" : "gem_shmem", 0, size);
 
 	if (GEM_WARN_ON(use_vram && !priv->vram.size))
 		return ERR_PTR(-EINVAL);

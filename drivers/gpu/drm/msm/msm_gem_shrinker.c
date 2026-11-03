@@ -52,9 +52,7 @@ purge(struct drm_gem_object *obj)
 	if (msm_gem_active(obj))
 		return false;
 
-	msm_gem_purge(obj);
-
-	return true;
+	return msm_gem_purge(obj);
 }
 
 static bool
@@ -66,9 +64,7 @@ evict(struct drm_gem_object *obj)
 	if (msm_gem_active(obj))
 		return false;
 
-	msm_gem_evict(obj);
-
-	return true;
+	return msm_gem_evict(obj);
 }
 
 static bool

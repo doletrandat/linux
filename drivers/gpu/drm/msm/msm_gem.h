@@ -69,7 +69,7 @@ struct msm_gem_vma {
 struct msm_gem_vma *msm_gem_vma_new(struct msm_gem_address_space *aspace);
 int msm_gem_vma_init(struct msm_gem_vma *vma, int size,
 		u64 range_start, u64 range_end);
-void msm_gem_vma_purge(struct msm_gem_vma *vma);
+int msm_gem_vma_purge(struct msm_gem_vma *vma);
 int msm_gem_vma_map(struct msm_gem_vma *vma, int prot, struct sg_table *sgt, int size);
 void msm_gem_vma_close(struct msm_gem_vma *vma);
 
@@ -77,6 +77,8 @@ struct msm_gem_object {
 	struct drm_gem_object base;
 
 	uint32_t flags;
+	/* Failed invalidation: retain backing storage/import attachment until reboot. */
+	bool iommu_fault;
 
 	/**
 	 * madv: are the backing pages purgeable?
@@ -224,7 +226,8 @@ msm_gem_assert_locked(struct drm_gem_object *obj)
 /* imported/exported objects are not purgeable: */
 static inline bool is_unpurgeable(struct msm_gem_object *msm_obj)
 {
-	return drm_gem_is_imported(&msm_obj->base) || msm_obj->pin_count;
+	return msm_obj->iommu_fault || drm_gem_is_imported(&msm_obj->base) ||
+		msm_obj->pin_count;
 }
 
 static inline bool is_purgeable(struct msm_gem_object *msm_obj)
@@ -244,8 +247,8 @@ static inline bool is_unevictable(struct msm_gem_object *msm_obj)
 	return is_unpurgeable(msm_obj) || msm_obj->vaddr;
 }
 
-void msm_gem_purge(struct drm_gem_object *obj);
-void msm_gem_evict(struct drm_gem_object *obj);
+bool msm_gem_purge(struct drm_gem_object *obj);
+bool msm_gem_evict(struct drm_gem_object *obj);
 void msm_gem_vunmap(struct drm_gem_object *obj);
 
 /* Created per submit-ioctl, to track bo's and cmdstream bufs, etc,

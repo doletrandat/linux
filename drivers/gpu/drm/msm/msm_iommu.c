@@ -6,6 +6,16 @@
 
 #include <linux/adreno-smmu-priv.h>
 #include <linux/io-pgtable.h>
+#include <linux/qcom-iommu.h>
+
+#if defined(CONFIG_ARM_DMA_USE_IOMMU)
+#include <asm/dma-iommu.h>
+#else
+#define arm_iommu_detach_device(...) ({ })
+#define arm_iommu_release_mapping(...) ({ })
+#define to_dma_iommu_mapping(dev) NULL
+#endif
+
 #include "msm_drv.h"
 #include "msm_mmu.h"
 
@@ -13,6 +23,7 @@ struct msm_iommu {
 	struct msm_mmu base;
 	struct iommu_domain *domain;
 	atomic_t pagetables;
+	bool faulted;
 };
 
 #define to_msm_iommu(x) container_of(x, struct msm_iommu, base)
@@ -278,7 +289,7 @@ struct msm_mmu *msm_iommu_pagetable_create(struct msm_mmu *parent)
 	int ret;
 
 	/* Get the pagetable configuration from the domain */
-	if (adreno_smmu->cookie)
+	if (adreno_smmu && adreno_smmu->cookie && adreno_smmu->get_ttbr1_cfg)
 		ttbr1_cfg = adreno_smmu->get_ttbr1_cfg(adreno_smmu->cookie);
 
 	/*
@@ -348,7 +359,7 @@ static int msm_gpu_fault_handler(struct iommu_domain *domain, struct device *dev
 	struct adreno_smmu_priv *adreno_smmu = dev_get_drvdata(iommu->base.dev);
 	struct adreno_smmu_fault_info info, *ptr = NULL;
 
-	if (adreno_smmu->get_fault_info) {
+	if (adreno_smmu && adreno_smmu->get_fault_info) {
 		adreno_smmu->get_fault_info(adreno_smmu->cookie, &info);
 		ptr = &info;
 	}
@@ -376,7 +387,7 @@ static void msm_iommu_set_stall(struct msm_mmu *mmu, bool enable)
 {
 	struct adreno_smmu_priv *adreno_smmu = dev_get_drvdata(mmu->dev);
 
-	if (adreno_smmu->set_stall)
+	if (adreno_smmu && adreno_smmu->set_stall)
 		adreno_smmu->set_stall(adreno_smmu->cookie, enable);
 }
 
@@ -385,6 +396,26 @@ static void msm_iommu_detach(struct msm_mmu *mmu)
 	struct msm_iommu *iommu = to_msm_iommu(mmu);
 
 	iommu_detach_device(iommu->domain, mmu->dev);
+}
+
+static bool msm_iommu_is_faulted(struct msm_mmu *mmu)
+{
+	struct msm_iommu *iommu = to_msm_iommu(mmu);
+
+	return READ_ONCE(iommu->faulted) || qcom_iommu_domain_faulted(iommu->domain);
+}
+
+static atomic_t superman_map_events = ATOMIC_INIT(0);
+static void msm_iommu_diag(struct msm_mmu *mmu, const char *stage,
+                           int ret, u64 iova, size_t len)
+{
+ unsigned int seq = atomic_inc_return(&superman_map_events);
+ if (ret)
+  dev_err_ratelimited(mmu->dev, "SUPERMAN_GPU_MMU seq=%u stage=%s ret=%d iova=0x%llx len=%zu\n",
+                     seq, stage, ret, iova, len);
+ else if (seq <= 128)
+  dev_info(mmu->dev, "SUPERMAN_GPU_MMU seq=%u stage=%s ret=0 iova=0x%llx len=%zu\n",
+           seq, stage, iova, len);
 }
 
 static int msm_iommu_map(struct msm_mmu *mmu, uint64_t iova,
@@ -397,7 +428,13 @@ static int msm_iommu_map(struct msm_mmu *mmu, uint64_t iova,
 	if (iova & BIT_ULL(48))
 		iova |= GENMASK_ULL(63, 49);
 
+	if (msm_iommu_is_faulted(mmu))
+		return -EIO;
+	msm_iommu_diag(mmu, "map_begin", 0, iova, len);
 	ret = iommu_map_sgtable(iommu->domain, iova, sgt, prot);
+	msm_iommu_diag(mmu, "map_end", ret == len ? 0 : -EINVAL, iova, ret);
+	if (msm_iommu_is_faulted(mmu))
+		return -EIO;
 	WARN_ON(!ret);
 
 	return (ret == len) ? 0 : -EINVAL;
@@ -410,8 +447,17 @@ static int msm_iommu_unmap(struct msm_mmu *mmu, uint64_t iova, size_t len)
 	if (iova & BIT_ULL(48))
 		iova |= GENMASK_ULL(63, 49);
 
-	iommu_unmap(iommu->domain, iova, len);
-
+	if (msm_iommu_is_faulted(mmu))
+		return -EIO;
+	msm_iommu_diag(mmu, "unmap_begin", 0, iova, len);
+	/* A byte count alone does not prove successful TLB invalidation. */
+	if (iommu_unmap(iommu->domain, iova, len) != len ||
+	    msm_iommu_is_faulted(mmu)) {
+		WRITE_ONCE(iommu->faulted, true);
+		msm_iommu_diag(mmu, "unmap_failed_retained", -EIO, iova, len);
+		return -EIO;
+	}
+	msm_iommu_diag(mmu, "unmap_end", 0, iova, len);
 	return 0;
 }
 
@@ -423,6 +469,7 @@ static void msm_iommu_destroy(struct msm_mmu *mmu)
 }
 
 static const struct msm_mmu_funcs funcs = {
+		.is_faulted = msm_iommu_is_faulted,
 		.detach = msm_iommu_detach,
 		.map = msm_iommu_map,
 		.unmap = msm_iommu_unmap,
@@ -456,7 +503,19 @@ struct msm_mmu *msm_iommu_new(struct device *dev, unsigned long quirks)
 
 	atomic_set(&iommu->pagetables, 0);
 
+	/* Drop the ARM32 default DMA domain before attaching the GPU domain. */
+	if (IS_ENABLED(CONFIG_ARM_DMA_USE_IOMMU)) {
+		struct dma_iommu_mapping *mapping = to_dma_iommu_mapping(dev);
+
+		if (mapping) {
+			arm_iommu_detach_device(dev);
+			arm_iommu_release_mapping(mapping);
+		}
+	}
+
+	msm_iommu_diag(&iommu->base, "attach_begin", 0, 0, 0);
 	ret = iommu_attach_device(iommu->domain, dev);
+	msm_iommu_diag(&iommu->base, "attach_end", ret, 0, 0);
 	if (ret) {
 		iommu_domain_free(domain);
 		kfree(iommu);
@@ -495,7 +554,7 @@ struct msm_mmu *msm_iommu_gpu_new(struct device *dev, struct msm_gpu *gpu, unsig
 	iommu_set_fault_handler(iommu->domain, msm_gpu_fault_handler, iommu);
 
 	/* Enable stall on iommu fault: */
-	if (adreno_smmu->set_stall)
+	if (adreno_smmu && adreno_smmu->set_stall)
 		adreno_smmu->set_stall(adreno_smmu->cookie, true);
 
 	return mmu;

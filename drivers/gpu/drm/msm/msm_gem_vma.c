@@ -39,18 +39,22 @@ msm_gem_address_space_get(struct msm_gem_address_space *aspace)
 }
 
 /* Actually unmap memory for the vma */
-void msm_gem_vma_purge(struct msm_gem_vma *vma)
+int msm_gem_vma_purge(struct msm_gem_vma *vma)
 {
 	struct msm_gem_address_space *aspace = vma->aspace;
 	unsigned size = vma->node.size;
+	int ret;
 
 	/* Don't do anything if the memory isn't mapped */
 	if (!vma->mapped)
-		return;
+		return 0;
 
-	aspace->mmu->funcs->unmap(aspace->mmu, vma->iova, size);
+	ret = aspace->mmu->funcs->unmap(aspace->mmu, vma->iova, size);
+	if (ret)
+		return ret;
 
 	vma->mapped = false;
+	return 0;
 }
 
 /* Map and pin vma: */
@@ -64,6 +68,8 @@ msm_gem_vma_map(struct msm_gem_vma *vma, int prot,
 	if (GEM_WARN_ON(!vma->iova))
 		return -EINVAL;
 
+	if (aspace && msm_mmu_is_faulted(aspace->mmu))
+		return -EIO;
 	if (vma->mapped)
 		return 0;
 
@@ -83,9 +89,8 @@ msm_gem_vma_map(struct msm_gem_vma *vma, int prot,
 	 */
 	ret = aspace->mmu->funcs->map(aspace->mmu, vma->iova, sgt, size, prot);
 
-	if (ret) {
+	if (ret && !msm_mmu_is_faulted(aspace->mmu))
 		vma->mapped = false;
-	}
 
 	return ret;
 }
@@ -95,7 +100,8 @@ void msm_gem_vma_close(struct msm_gem_vma *vma)
 {
 	struct msm_gem_address_space *aspace = vma->aspace;
 
-	GEM_WARN_ON(vma->mapped);
+	if (GEM_WARN_ON(vma->mapped))
+		return;
 
 	spin_lock(&aspace->lock);
 	if (vma->iova)

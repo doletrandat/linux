@@ -194,6 +194,9 @@ struct msm_gpu {
 	struct msm_ringbuffer *rb[MSM_GPU_MAX_RINGS];
 	int nr_rings;
 
+	/* Only submission backends that emit memptrs stats may account them. */
+	bool has_hw_submit_stats;
+
 	/**
 	 * sysprof_active:
 	 *
@@ -642,6 +645,7 @@ void msm_devfreq_boost(struct msm_gpu *gpu, unsigned factor);
 void msm_devfreq_active(struct msm_gpu *gpu);
 void msm_devfreq_idle(struct msm_gpu *gpu);
 
+void msm_gpu_diag(struct msm_gpu *gpu, const char *stage, int ret, u32 value);
 int msm_gpu_hw_init(struct msm_gpu *gpu);
 
 void msm_gpu_perfcntr_start(struct msm_gpu *gpu);
@@ -650,7 +654,7 @@ int msm_gpu_perfcntr_sample(struct msm_gpu *gpu, uint32_t *activetime,
 		uint32_t *totaltime, uint32_t ncntrs, uint32_t *cntrs);
 
 void msm_gpu_retire(struct msm_gpu *gpu);
-void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit);
+int msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit);
 
 int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 		struct msm_gpu *gpu, const struct msm_gpu_funcs *funcs,
@@ -663,7 +667,7 @@ void msm_gpu_cleanup(struct msm_gpu *gpu);
 
 struct msm_gpu *adreno_load_gpu(struct drm_device *dev);
 bool adreno_has_gpu(struct device_node *node);
-void __init adreno_register(void);
+int __init adreno_register(void);
 void __exit adreno_unregister(void);
 
 static inline void msm_submitqueue_put(struct msm_gpu_submitqueue *queue)
