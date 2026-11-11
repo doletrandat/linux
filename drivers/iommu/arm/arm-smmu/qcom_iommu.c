@@ -28,6 +28,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
+#include <linux/reset.h>
 #include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -85,6 +86,12 @@ struct qcom_iommu_cfg {
 	bool				 halt;
 	/* faulting transactions must terminate rather than stall */
 	bool				 no_stall;
+	/*
+	 * No usable GDSC: emulate its power collapse by asserting the block
+	 * reset at suspend (the master has halted its AXI port and is clocked
+	 * off) and redo TrustZone's secure configuration at resume.
+	 */
+	bool				 reset_on_suspend;
 	const struct qcom_iommu_bfb_reg	*bfb;
 	unsigned int			 num_bfb;
 	const struct qcom_iommu_sid	*sids;	/* one SMR slot per entry */
@@ -106,6 +113,8 @@ struct qcom_iommu_dev {
 	/* Shared global-register programming across attached domains. */
 	struct mutex		 register_lock;
 	u8			 max_asid;
+	struct reset_control	*rst;	/* optional block reset released on resume */
+	bool			 block_was_reset;	/* secure config lost: restore at resume */
 	struct qcom_iommu_ctx	*ctxs[];   /* indexed by asid */
 };
 
@@ -368,6 +377,10 @@ static irqreturn_t qcom_iommu_fault(int irq, void *dev)
 	u64 iova;
 	struct iommu_domain *domain;
 	int ret;
+
+	/* A suspended instance may be unpowered; its registers would stall the bus. */
+	if (pm_runtime_suspended(ctx->dev->parent))
+		return IRQ_NONE;
 
 	fsr = iommu_readl(ctx, ARM_SMMU_CB_FSR);
 
@@ -1205,8 +1218,15 @@ static int qcom_iommu_ctx_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "qcom,msm-iommu-v2-sec"))
 		ctx->secured_ctx = true;
 
-	/* Per-instance contexts are first accessed during powered resume. */
-	if (!ctx->secured_ctx && !qcom_iommu->cfg)
+	/*
+	 * Per-instance contexts are first accessed during powered resume. A
+	 * configless instance in a power domain (MSM8226 Venus SMMU, VENUS0
+	 * GDSC off at boot) is unclocked here too: touching CB_FSR stalls the
+	 * bus until the watchdog resets the SoC. Only always-on instances
+	 * (MSM8916 apps SMMU) clear a bootloader fault at probe.
+	 */
+	if (!ctx->secured_ctx && !qcom_iommu->cfg && !dev->parent->pm_domain &&
+	    of_property_read_bool(dev->parent->of_node, "qcom,clear-fault-at-probe"))
 		iommu_writel(ctx, ARM_SMMU_CB_FSR, iommu_readl(ctx, ARM_SMMU_CB_FSR));
 
 	ret = devm_request_irq(dev, irq,
@@ -1354,6 +1374,16 @@ static int qcom_iommu_device_probe(struct platform_device *pdev)
 				     "missing global register space\n");
 	}
 
+	/*
+	 * MSM8226 Venus: the boot chain hands the video block over with its
+	 * VENUS0 BCR reset asserted, and genpd's late "power off unused" asserts
+	 * it again (gdsc_disable on a PWRSTS_ON domain). Release it in every
+	 * resume, i.e. before any attach/context programming; never re-assert.
+	 */
+	qcom_iommu->rst = devm_reset_control_get_optional_exclusive(dev, NULL);
+	if (IS_ERR(qcom_iommu->rst))
+		return dev_err_probe(dev, PTR_ERR(qcom_iommu->rst), "failed to get reset\n");
+
 	clk = devm_clk_get(dev, "iface");
 	if (IS_ERR(clk)) {
 		dev_err(dev, "failed to get iface clock\n");
@@ -1451,6 +1481,9 @@ static int __maybe_unused qcom_iommu_resume(struct device *dev)
 	qcom_iommu_diag(qcom_iommu, "resume_begin", 0, 0);
 	if (atomic_read(&qcom_iommu->faulted))
 		return -EIO;
+	ret = reset_control_deassert(qcom_iommu->rst);
+	if (ret)
+		return ret;
 	ret = clk_bulk_prepare_enable(CLK_NUM, qcom_iommu->clks);
 	qcom_iommu_diag(qcom_iommu, "clocks_enable", ret, 0);
 	if (ret < 0)
@@ -1464,8 +1497,11 @@ static int __maybe_unused qcom_iommu_resume(struct device *dev)
 		ret = qcom_iommu_reset_ns(qcom_iommu);
 		if (ret)
 			goto failed_halt;
-	} else if (dev->pm_domain) {
+	} else if (dev->pm_domain ||
+		   (qcom_iommu->cfg && qcom_iommu->cfg->reset_on_suspend &&
+		    qcom_iommu->block_was_reset)) {
 		ret = qcom_scm_restore_sec_cfg(qcom_iommu->sec_id, 0);
+		qcom_iommu_diag(qcom_iommu, "restore_sec_cfg", ret, 0);
 		if (ret)
 			goto failed_halt;
 	}
@@ -1485,6 +1521,7 @@ static int __maybe_unused qcom_iommu_resume(struct device *dev)
 		goto failed_halt;
 	}
 	qcom_iommu_unhalt(qcom_iommu);
+	qcom_iommu->block_was_reset = false;
 	mutex_unlock(&qcom_iommu->register_lock);
 	qcom_iommu_diag(qcom_iommu, "resume_end", 0, 0);
 	return 0;
@@ -1508,6 +1545,11 @@ static int __maybe_unused qcom_iommu_suspend(struct device *dev)
 	}
 	qcom_iommu_diag(qcom_iommu, "suspend_clocks", 0, 0);
 	clk_bulk_disable_unprepare(CLK_NUM, qcom_iommu->clks);
+	if (qcom_iommu->cfg && qcom_iommu->cfg->reset_on_suspend && qcom_iommu->rst &&
+	    !reset_control_assert(qcom_iommu->rst)) {
+		qcom_iommu->block_was_reset = true;
+		qcom_iommu_diag(qcom_iommu, "suspend_block_reset", 0, 0);
+	}
 	mutex_unlock(&qcom_iommu->register_lock);
 	return 0;
 }
@@ -1633,6 +1675,21 @@ static const struct qcom_iommu_bfb_reg msm8226_gpu_bfb[] = {
 	{ 0x008, 0x00000000 },
 };
 
+/*
+ * MSM8226 Venus SMMU: TrustZone owns the global space, stream matching, BFB and
+ * the secure contexts (qcom,iommu-secure-id 0); Linux only programs the
+ * non-secure context. Page-table format and walker quirks match the GPU SMMU:
+ * with LPAE and AFE the firmware's first queue access stalls on an
+ * access-flag fault.
+ */
+static const struct qcom_iommu_cfg msm8226_venus_cfg = {
+	.fmt = ARM_V7S,
+	.no_afe = true,
+	.no_stall = true,
+	.ctx_restore = true,
+	.reset_on_suspend = true,
+};
+
 static const struct qcom_iommu_cfg msm8226_gpu_cfg = {
 	/* Matching MSM8226 downstream DT sets qcom,iommu-enable-halt. */
 	.halt = true,
@@ -1648,6 +1705,7 @@ static const struct qcom_iommu_cfg msm8226_gpu_cfg = {
 
 static const struct of_device_id qcom_iommu_of_match[] = {
 	{ .compatible = "qcom,msm8226-gpu-iommu", .data = &msm8226_gpu_cfg },
+	{ .compatible = "qcom,msm8226-venus-iommu", .data = &msm8226_venus_cfg },
 	{ .compatible = "qcom,msm-iommu-v1" },
 	{ .compatible = "qcom,msm-iommu-v2" },
 	{ .compatible = "qcom,msm8974-gpu-iommu", .data = &msm8974_gpu_cfg },
