@@ -1365,7 +1365,6 @@ void __init arm_mm_memblock_reserve(void)
  */
 static void __init devicemaps_init(const struct machine_desc *mdesc)
 {
-	extern void lumia_setup_arch_fdt_diag23(unsigned int pulses);
 	struct map_desc map;
 	unsigned long addr;
 	void *vectors;
@@ -1382,14 +1381,6 @@ static void __init devicemaps_init(const struct machine_desc *mdesc)
 	 */
 	for (addr = VMALLOC_START; addr < (FIXADDR_TOP & PMD_MASK); addr += PMD_SIZE)
 		pmd_clear(pmd_off_k(addr));
-
-	/* Keep the no-UART trampoline reachable after the final TLB flush. */
-	addr = __pa_symbol(lumia_setup_arch_fdt_diag23);
-	map.pfn = __phys_to_pfn(addr);
-	map.virtual = addr & PAGE_MASK;
-	map.length = PAGE_SIZE;
-	map.type = MT_MEMORY_RWX;
-	__create_mapping(&init_mm, &map, early_alloc, false);
 
 	if (__atags_pointer) {
 		/* create a read-only mapping of the device tree */

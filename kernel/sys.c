@@ -2478,35 +2478,6 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 	unsigned char comm[sizeof(me->comm)];
 	long error;
 
-	/* Temporary no-UART results from the Lumia userspace probes. */
-	if ((unsigned int)option == 0x4c554d49) {
-		extern void lumia_setup_arch_fdt_diag23(unsigned int pulses);
-		unsigned int pulses;
-
-		switch (arg2) {
-		case 0x53555045: /* SUPE: first userspace syscall */
-			pulses = 16;
-			break;
-		case 0x4c4f4753: /* LOGS: kernel log saved and synced */
-			pulses = 17;
-			break;
-		case 0x4e4f5344: /* NOSD: LUMIA_BOOT block device absent */
-			pulses = 18;
-			break;
-		case 0x4d4e5446: /* MNTF: filesystem mount failed */
-			pulses = 19;
-			break;
-		case 0x4b4c4f47: /* KLOG: kernel log read failed */
-			pulses = 20;
-			break;
-		default:         /* file creation/write/sync failed */
-			pulses = 21;
-			break;
-		}
-
-		lumia_setup_arch_fdt_diag23(pulses);
-	}
-
 	error = security_task_prctl(option, arg2, arg3, arg4, arg5);
 	if (error != -ENOSYS)
 		return error;
