@@ -121,6 +121,10 @@ static int spm_cpuidle_register(struct device *cpuidle_dev, int cpu)
 	if (ret <= 0)
 		return ret ? : -ENODEV;
 
+	/* Power collapse stays opt-in through sysfs until validated on hardware. */
+	if (of_machine_is_compatible("nokia,superman"))
+		data->cpuidle_driver.states[1].flags |= CPUIDLE_FLAG_OFF;
+
 	return cpuidle_register(&data->cpuidle_driver, NULL);
 }
 
